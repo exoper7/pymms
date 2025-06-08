@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QSpinBox
 )
 from PyQt6.QtCore import Qt, QTimer, QObject # Dodano QObject dla disconnect
+from PyQt6.QtGui import QIcon # Import QIcon
 
 from pymodbus.client import ModbusTcpClient, ModbusSerialClient
 from pymodbus.exceptions import ModbusException # Import bazowej klasy wyjątku Modbus
@@ -258,13 +259,22 @@ class ModbusValueEditor(QDialog):
 
 class ModbusClientApp(QMainWindow):
     # Wersja aplikacji, która będzie inkrementowana
-    __version__ = "1.06"
+    __version__ = "1.08"
 
     def __init__(self):
         super().__init__()
         # Zmieniono tytuł aplikacji, dodając numer wersji
         self.setWindowTitle(f"pymms (Python Modbus Master Simulator) v{self.__version__}")
         self.setGeometry(100, 100, 900, 650) # x, y, width, height
+
+        # Ustawienie ikony aplikacji
+        try:
+            self.setWindowIcon(QIcon('icon.png'))
+        except Exception as e:
+            # W przypadku problemów z ładowaniem ikony, wyświetl błąd na pasku statusu (jeśli jest już zainicjalizowany)
+            # Lub po prostu wypisz do konsoli, jeśli pasku statusu jeszcze nie ma
+            print(f"Błąd ładowania ikony: {e}. Upewnij się, że plik 'icon.png' znajduje się w tym samym folderze co aplikacja.")
+
 
         self.modbus_client = None
         self.connection_type = "RTU" # Default connection type
@@ -493,7 +503,7 @@ class ModbusClientApp(QMainWindow):
 
         # Status Bar
         self.status_message_label = QLabel("Ready") # Persistent status message label
-        self.status_message_label.setStyleSheet("color: black;") # Default color
+        self.status_message_label.setStyleSheet("") # Default color
         self.statusBar().addWidget(self.status_message_label, 1) # Add to status bar with stretch
 
         self.stats_label = QLabel("") # Persistent stats label
@@ -1021,7 +1031,7 @@ class ModbusClientApp(QMainWindow):
                 self.status_message_label.setStyleSheet("color: red;")
             elif response: # This covers successful register/coil writes that return a response object
                 self.status_message_label.setText(f"Successfully wrote {value} to address {address}.")
-                self.status_message_label.setStyleSheet("color: black;")
+                self.status_message_label.setStyleSheet("")
                 # After writing, refresh data to see the change
                 self.read_modbus_data()
             else:
@@ -1029,7 +1039,7 @@ class ModbusClientApp(QMainWindow):
                 # For write_coil, if no exception, it's generally successful.
                 if "Boolean" in data_type_str:
                     self.status_message_label.setText(f"Successfully wrote {value} to address {address}.")
-                    self.status_message_label.setStyleSheet("color: black;")
+                    self.status_message_label.setStyleSheet("")
                     self.read_modbus_data()
                 else:
                     QMessageBox.critical(self.centralWidget(), "Write Error", "No response from device during write operation.")
