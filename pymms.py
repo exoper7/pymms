@@ -585,8 +585,8 @@ class ModbusClientApp(QMainWindow):
         if self.failed_polls > 0:
             stats_text += f" (Failed: {self.failed_polls})" # Add failed count
         if self.total_polls > 0:
-            stats_text += f" | Last: {self.last_response_time:.3f}s"
-            stats_text += f" | Avg: {self.average_response_time:.3f}s"
+            stats_text += f" | Last: {self.last_response_time:.1f}ms"
+            stats_text += f" | Avg: {self.average_response_time:.1f}ms"
         self.stats_label.setText(stats_text) # Update dedicated stats label
 
 
@@ -759,6 +759,7 @@ class ModbusClientApp(QMainWindow):
 
             end_time = time.time() # End timing
             duration = end_time - start_time
+            duration = duration * 1000.00
 
             self.total_polls += 1
             self.last_response_time = duration
