@@ -259,7 +259,7 @@ class ModbusValueEditor(QDialog):
 
 class ModbusClientApp(QMainWindow):
     # Wersja aplikacji, która będzie inkrementowana
-    __version__ = "1.08"
+    __version__ = "1.09"
 
     def __init__(self):
         super().__init__()
@@ -490,14 +490,15 @@ class ModbusClientApp(QMainWindow):
 
         # --- Results Table ---
         self.registers_table = QTableWidget()
-        self.registers_table.setColumnCount(4) # Register, Raw Value, Interpreted Value, Type
+        self.registers_table.setColumnCount(5) # Register, Raw Value, Interpreted Value, Type
         self.registers_table.setHorizontalHeaderLabels([
-            "Register", "Raw Value (HEX/Bool)", "Value", "Type"
+            "Register","Register (HEX)" ,"Raw Value (HEX/Bool)", "Value", "Type"
         ])
         self.registers_table.cellDoubleClicked.connect(self.on_table_double_click)
-        self.registers_table.setColumnWidth(0, 80)
-        self.registers_table.setColumnWidth(1, 120)
-        self.registers_table.setColumnWidth(2, 150)
+        self.registers_table.setColumnWidth(0, 100)
+        self.registers_table.setColumnWidth(1, 100)
+        self.registers_table.setColumnWidth(2, 130)
+        self.registers_table.setColumnWidth(3, 150)
         self.registers_table.horizontalHeader().setStretchLastSection(True) # Last column stretches
         main_layout.addWidget(self.registers_table)
 
@@ -816,9 +817,11 @@ class ModbusClientApp(QMainWindow):
                 current_address = start_address + i
                 self.registers_table.insertRow(row_count)
                 self.registers_table.setItem(row_count, 0, QTableWidgetItem(str(current_address)))
-                self.registers_table.setItem(row_count, 1, QTableWidgetItem(str(bit_value))) # Raw value is boolean
-                self.registers_table.setItem(row_count, 2, QTableWidgetItem(str(bit_value))) # Interpreted value is boolean
-                self.registers_table.setItem(row_count, 3, QTableWidgetItem("Boolean"))
+                current_address_hex = f"0x{current_address:04X}"
+                self.registers_table.setItem(row_count, 1, QTableWidgetItem(str(current_address_hex)))
+                self.registers_table.setItem(row_count, 2, QTableWidgetItem(str(bit_value))) # Raw value is boolean
+                self.registers_table.setItem(row_count, 3, QTableWidgetItem(str(bit_value))) # Interpreted value is boolean
+                self.registers_table.setItem(row_count, 4, QTableWidgetItem("Boolean"))
                 row_count += 1
         else:
             # Handle register data (Holding Registers, Input Registers)
@@ -832,6 +835,8 @@ class ModbusClientApp(QMainWindow):
 
                 # Column 0: Register Address
                 self.registers_table.setItem(row_count, 0, QTableWidgetItem(str(current_address)))
+                current_address_hex = f"0x{current_address:04X}"
+                self.registers_table.setItem(row_count, 1, QTableWidgetItem(str(current_address_hex)))
 
                 interpreted_value = "N/A"
                 num_words_needed = 1 # Default 16-bit
@@ -886,25 +891,25 @@ class ModbusClientApp(QMainWindow):
                         num_words_needed = 4 # Still skip 4, even if incomplete
 
                 # Column 1: Raw Value (HEX)
-                self.registers_table.setItem(row_count, 1, QTableWidgetItem(raw_hex_str))
+                self.registers_table.setItem(row_count, 2, QTableWidgetItem(raw_hex_str))
 
                 # Column 2: Interpreted Value
-                self.registers_table.setItem(row_count, 2, QTableWidgetItem(str(interpreted_value)))
+                self.registers_table.setItem(row_count, 3, QTableWidgetItem(str(interpreted_value)))
 
                 # Column 3: Type (for informational purposes only, not editable)
-                self.registers_table.setItem(row_count, 3, QTableWidgetItem(data_type + (f" ({swap_type})" if num_words_needed > 1 else "")))
+                self.registers_table.setItem(row_count, 4, QTableWidgetItem(data_type + (f" ({swap_type})" if num_words_needed > 1 else "")))
 
                 row_count += 1
                 i += num_words_needed # Skip by appropriate number of registers (1 for 16-bit, 2 for 32-bit, 4 for 64-bit)
 
     def on_table_double_click(self, row, column):
         """Handles double-click on a table cell, opening the value editor."""
-        if column != 2: # Allow editing only the interpreted value column
+        if column != 3: # Allow editing only the interpreted value column
             return
 
         item_address = self.registers_table.item(row, 0) # Register Address
-        item_current_value = self.registers_table.item(row, 2) # Current Value
-        item_data_type = self.registers_table.item(row, 3) # Data Type (e.g., "UINT16 (16-bit Unsigned)")
+        item_current_value = self.registers_table.item(row, 3) # Current Value
+        item_data_type = self.registers_table.item(row, 4) # Data Type (e.g., "UINT16 (16-bit Unsigned)")
 
         if not (item_address and item_current_value and item_data_type): return
 
