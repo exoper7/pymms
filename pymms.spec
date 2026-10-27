@@ -5,7 +5,7 @@ a = Analysis(
     ['pymms.pyw'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('icon.png', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

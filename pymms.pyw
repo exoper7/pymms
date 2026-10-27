@@ -1,4 +1,5 @@
 import sys
+import os
 import serial.tools.list_ports # Do wykrywania portów COM
 import time # Import time for performance measurement
 import logging # Import modułu logging
@@ -18,6 +19,58 @@ from struct import pack, unpack
 # Konfiguracja logowania dla pymodbus, aby wyciszyć komunikaty o ponownych próbach/timeoutach
 # Możesz zmienić poziom na logging.INFO lub logging.DEBUG, jeśli potrzebujesz więcej szczegółów
 logging.getLogger("pymodbus.client").setLevel(logging.ERROR)
+
+
+def resource_path(name):
+    """Ścieżka do zasobu - działa niezależnie od katalogu roboczego, także w exe zbudowanym przez PyInstaller."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
+
+# --- Akcent kolorystyczny (odróżnia pymms od pymss przy pracy obok siebie) ---
+
+ACCENT = "#8FCE00"        # zielony - nagłówek tabeli, pasek statusu, ramki, zaznaczenie
+ACCENT_TEXT = "#4F7300"   # ciemniejsza zieleń - tytuły sekcji (czytelna na jasnym tle)
+ACCENT_BORDER = "#7DB300" # linie między kolumnami nagłówka
+STATUS_RED = "#B00020"    # kolory komunikatów czytelne na zielonym pasku statusu
+STATUS_ORANGE = "#8A4B00"
+
+ACCENT_STYLESHEET = f"""
+QGroupBox {{
+    border: 1px solid {ACCENT};
+    border-radius: 4px;
+    margin-top: 10px;
+    padding-top: 6px;
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 8px;
+    padding: 0 4px;
+    color: {ACCENT_TEXT};
+    font-weight: bold;
+}}
+QHeaderView::section {{
+    background-color: {ACCENT};
+    color: #1A1A1A;
+    font-weight: bold;
+    padding: 4px;
+    border: none;
+    border-right: 1px solid {ACCENT_BORDER};
+}}
+QTableWidget {{
+    gridline-color: #D0D7E0;
+    selection-background-color: {ACCENT};
+    selection-color: #1A1A1A;
+}}
+QStatusBar {{
+    background-color: {ACCENT};
+    color: #1A1A1A;
+}}
+QStatusBar QLabel {{
+    color: #1A1A1A;
+}}
+"""
 
 
 # --- Funkcje pomocnicze do konwersji danych ---
@@ -259,7 +312,7 @@ class ModbusValueEditor(QDialog):
 
 class ModbusClientApp(QMainWindow):
     # Wersja aplikacji, która będzie inkrementowana
-    __version__ = "1.09"
+    __version__ = "1.10"
 
     def __init__(self):
         super().__init__()
@@ -269,7 +322,7 @@ class ModbusClientApp(QMainWindow):
 
         # Ustawienie ikony aplikacji
         try:
-            self.setWindowIcon(QIcon('icon.png'))
+            self.setWindowIcon(QIcon(resource_path('icon.png')))
         except Exception as e:
             # W przypadku problemów z ładowaniem ikony, wyświetl błąd na pasku statusu (jeśli jest już zainicjalizowany)
             # Lub po prostu wypisz do konsoli, jeśli pasku statusu jeszcze nie ma
@@ -632,11 +685,11 @@ class ModbusClientApp(QMainWindow):
                 self.status_message_label.setStyleSheet("") # Reset color on success
             else:
                 self.status_message_label.setText(f"Connection error with Modbus ({self.connection_type}). Check parameters.")
-                self.status_message_label.setStyleSheet("color: red;") # Set color to red on error
+                self.status_message_label.setStyleSheet(f"color: {STATUS_RED};") # Set color to red on error
                 self.modbus_client = None # Reset client on error
         except Exception as e:
             self.status_message_label.setText(f"Configuration or connection error: {e}")
-            self.status_message_label.setStyleSheet("color: red;") # Set color to red on error
+            self.status_message_label.setStyleSheet(f"color: {STATUS_RED};") # Set color to red on error
             self.modbus_client = None # Reset client on error
         finally:
             self.update_connection_buttons()
@@ -775,7 +828,7 @@ class ModbusClientApp(QMainWindow):
                 self.status_message_label.setStyleSheet("") # Reset color on success
             else:
                 self.status_message_label.setText("Successfully read, but no data received for specified parameters. Check slave configuration (address/quantity).")
-                self.status_message_label.setStyleSheet("color: orange;") # Użyj pomarańczowego dla ostrzeżenia/braku danych
+                self.status_message_label.setStyleSheet(f"color: {STATUS_ORANGE};") # Użyj pomarańczowego dla ostrzeżenia/braku danych
             
             self.update_status_bar_stats() # Update status bar with new stats
 
@@ -783,7 +836,7 @@ class ModbusClientApp(QMainWindow):
             error_message = str(e)
             # Obsługa komunikatów o braku odpowiedzi lub zamknięciu połączenia (traktujemy jako timeout)
             self.status_message_label.setText(f"Modbus communication error: {error_message}")
-            self.status_message_label.setStyleSheet("color: red;")
+            self.status_message_label.setStyleSheet(f"color: {STATUS_RED};")
             
             self.failed_polls += 1 # Zwiększenie licznika nieudanych odpytań dla każdego błędu Modbus
             self.update_status_bar_stats() # Natychmiastowa aktualizacja statystyk
@@ -796,7 +849,7 @@ class ModbusClientApp(QMainWindow):
 
         except Exception as e: # Catch any other unexpected errors
             self.status_message_label.setText(f"An unexpected error occurred: {e}")
-            self.status_message_label.setStyleSheet("color: red;")
+            self.status_message_label.setStyleSheet(f"color: {STATUS_RED};")
             self.failed_polls += 1 # Increment failed polls for unexpected errors
             self.update_status_bar_stats() # Update stats immediately
             if self.polling_timer.isActive():
@@ -1034,7 +1087,7 @@ class ModbusClientApp(QMainWindow):
             if response and response.isError():
                 QMessageBox.critical(self.centralWidget(), "Write Error", f"Modbus Error during write: {response}")
                 self.status_message_label.setText(f"Write error: {response}")
-                self.status_message_label.setStyleSheet("color: red;")
+                self.status_message_label.setStyleSheet(f"color: {STATUS_RED};")
             elif response: # This covers successful register/coil writes that return a response object
                 self.status_message_label.setText(f"Successfully wrote {value} to address {address}.")
                 self.status_message_label.setStyleSheet("")
@@ -1050,24 +1103,30 @@ class ModbusClientApp(QMainWindow):
                 else:
                     QMessageBox.critical(self.centralWidget(), "Write Error", "No response from device during write operation.")
                     self.status_message_label.setText("No response during write operation.")
-                    self.status_message_label.setStyleSheet("color: red;")
+                    self.status_message_label.setStyleSheet(f"color: {STATUS_RED};")
 
         except ModbusException as e:
             QMessageBox.critical(self, "Modbus Error", f"Modbus communication error during write: {e}")
             self.status_message_label.setText(f"Modbus communication error during write: {e}")
-            self.status_message_label.setStyleSheet("color: red;")
+            self.status_message_label.setStyleSheet(f"color: {STATUS_RED};")
         except ValueError as e:
             QMessageBox.critical(self, "Value Error", f"Entered value is not valid for the selected type: {e}")
             self.status_message_label.setText(f"Error: Entered value is not valid: {e}")
-            self.status_message_label.setStyleSheet("color: red;")
+            self.status_message_label.setStyleSheet(f"color: {STATUS_RED};")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"An unexpected error occurred during write: {e}")
             self.status_message_label.setText(f"Unexpected write error: {e}")
-            self.status_message_label.setStyleSheet("color: red;")
+            self.status_message_label.setStyleSheet(f"color: {STATUS_RED};")
 
 
 if __name__ == "__main__":
+    try: # Własna ikona na pasku zadań Windows (zamiast ikony pythonw)
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("pymms.modbus.master.simulator")
+    except Exception:
+        pass
     app = QApplication(sys.argv)
+    app.setStyleSheet(ACCENT_STYLESHEET)
     window = ModbusClientApp()
     window.show()
     sys.exit(app.exec())
