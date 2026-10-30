@@ -312,7 +312,7 @@ class ModbusValueEditor(QDialog):
 
 class ModbusClientApp(QMainWindow):
     # Wersja aplikacji, która będzie inkrementowana
-    __version__ = "1.10"
+    __version__ = "1.11"
 
     def __init__(self):
         super().__init__()
@@ -374,8 +374,14 @@ class ModbusClientApp(QMainWindow):
         self.rtu_params_layout = QHBoxLayout(self.rtu_params_widget) # Set layout for this widget
         self.rtu_params_layout.addWidget(QLabel("COM Port:"))
         self.com_port_cb = QComboBox()
+        self.com_port_cb.setMinimumWidth(110)
         self.populate_com_ports() # Populate list of available COM ports
         self.rtu_params_layout.addWidget(self.com_port_cb)
+        self.refresh_ports_btn = QPushButton("↻")
+        self.refresh_ports_btn.setToolTip("Refresh COM port list")
+        self.refresh_ports_btn.setFixedWidth(28)
+        self.refresh_ports_btn.clicked.connect(self.populate_com_ports)
+        self.rtu_params_layout.addWidget(self.refresh_ports_btn)
         self.rtu_params_layout.addWidget(QLabel("Baud Rate:"))
         self.baud_rate_cb = QComboBox()
         self.baud_rate_cb.addItems(["9600", "19200", "38400", "57600", "115200"])
@@ -565,17 +571,22 @@ class ModbusClientApp(QMainWindow):
         self.update_status_bar_stats() # Initial update
 
     def populate_com_ports(self):
-        """Populates the QComboBox with available COM ports."""
+        """Populates the QComboBox with available COM ports (keeps the current selection on refresh)."""
+        current = self.com_port_cb.currentText()
+        self.com_port_cb.clear()
         ports = serial.tools.list_ports.comports()
         if not ports:
             self.com_port_cb.addItem("No COM Ports")
             self.com_port_cb.setEnabled(False)
             return
 
-        self.com_port_cb.clear()
-        for port in ports:
+        for port in sorted(ports, key=lambda p: (len(p.device), p.device)): # COM3 przed COM12
             self.com_port_cb.addItem(port.device)
+            self.com_port_cb.setItemData(self.com_port_cb.count() - 1, port.description, Qt.ItemDataRole.ToolTipRole)
         self.com_port_cb.setEnabled(True)
+        index = self.com_port_cb.findText(current)
+        if index >= 0:
+            self.com_port_cb.setCurrentIndex(index)
 
     def on_connection_type_changed(self, index):
         """Toggles visibility of RTU/TCP parameters based on selected connection type."""
