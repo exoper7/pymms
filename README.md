@@ -19,15 +19,18 @@ pymms bez fizycznego urządzenia.
   z kolejnością bajtów ABCD / CDAB / BADC / DCBA.
 - **Zapis** wartości dwuklikiem w tabeli: 0x05 dla coili, 0x06 dla rejestrów 16-bitowych, 0x10 dla 32- i 64-bitowych.
 - **Cykliczny odczyt** z ustawianym interwałem.
+- **Okno logów transmisji** – każda wysłana i odebrana ramka w HEX z dekodowaniem, a także timeouty, błędy CRC,
+  niepełne i spóźnione odpowiedzi.
 - Statystyki na pasku statusu: liczba odpytań, liczba błędów, czas ostatniej odpowiedzi i średni czas odpowiedzi.
+- Własna implementacja Modbus master (TCP i RTU) – nie wymaga biblioteki pymodbus.
 
 ## Wymagania i uruchomienie
 
 - Python 3.10+
-- Biblioteki: `PyQt6`, `pymodbus` (testowane z 3.9), `pyserial`
+- Biblioteki: `PyQt6`, `pyserial`
 
 ```bash
-pip install PyQt6 pymodbus pyserial
+pip install PyQt6 pyserial
 ```
 
 ```bash
@@ -97,6 +100,25 @@ odpowiedzi.
 
 Pasek statusu pokazuje liczbę odpytań (**Polls**), liczbę nieudanych odpytań (**Failed**) oraz czas ostatniej
 (**Last**) i średni czas odpowiedzi (**Avg**) w milisekundach.
+
+### 6. Okno logów transmisji
+
+Przycisk **Transmission Log** otwiera okno z pełnym zapisem komunikacji, takie samo jak w pymss.
+
+![Okno logów transmisji](docs/pymms_log.png)
+
+Każda linia zawiera czas z dokładnością do milisekundy, kierunek (**TX** – zapytanie wysłane przez pymms,
+**RX** – odpowiedź urządzenia), kanał (adres IP:port albo port COM), długość i pełną ramkę w HEX. Pod ramką jest
+jej rozkodowanie: nagłówek MBAP (TCP) lub Slave ID (RTU), kod funkcji, adres, ilość, wartości albo wyjątek.
+
+Na czerwono (**ERROR**) zapisywane są problemy z komunikacją:
+- brak odpowiedzi w zadanym czasie (timeout), razem z bajtami niepełnej odpowiedzi, jeśli jakieś przyszły,
+- błędny CRC i bajty odrzucone przed odpowiedzią lub po niej (RTU),
+- spóźniona odpowiedź na poprzednie zapytanie, odrzucona przed wysłaniem kolejnego,
+- odpowiedź od innego Slave ID niż odpytywany, zerwane połączenie, błąd portu szeregowego.
+
+Opcje okna: filtry **RX / TX / Info / Errors**, **Decode frames**, **Pause**, **Auto-scroll**, limit linii
+(**Max lines**), **Clear** i zapis do pliku (**Save...**).
 
 ## Kolejność bajtów
 

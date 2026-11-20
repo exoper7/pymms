@@ -1,1 +1,1 @@
-pip install PyQt6 pymodbus pyserial
+pip install PyQt6 pyserial

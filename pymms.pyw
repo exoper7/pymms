@@ -1,24 +1,21 @@
 import sys
 import os
+import socket
+import struct
+import serial
 import serial.tools.list_ports # Do wykrywania portów COM
 import time # Import time for performance measurement
-import logging # Import modułu logging
+from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QGroupBox, QLineEdit, QPushButton, QComboBox, QLabel,
+    QGroupBox, QLineEdit, QPushButton, QComboBox, QLabel, QCheckBox,
     QTableWidget, QTableWidgetItem, QDialog, QDialogButtonBox,
-    QMessageBox, QSpinBox
+    QMessageBox, QSpinBox, QPlainTextEdit, QFileDialog
 )
 from PyQt6.QtCore import Qt, QTimer, QObject # Dodano QObject dla disconnect
-from PyQt6.QtGui import QIcon # Import QIcon
+from PyQt6.QtGui import QIcon, QColor, QFont, QTextCursor, QTextCharFormat
 
-from pymodbus.client import ModbusTcpClient, ModbusSerialClient
-from pymodbus.exceptions import ModbusException # Import bazowej klasy wyjątku Modbus
 from struct import pack, unpack
-
-# Konfiguracja logowania dla pymodbus, aby wyciszyć komunikaty o ponownych próbach/timeoutach
-# Możesz zmienić poziom na logging.INFO lub logging.DEBUG, jeśli potrzebujesz więcej szczegółów
-logging.getLogger("pymodbus.client").setLevel(logging.ERROR)
 
 
 def resource_path(name):
@@ -71,6 +68,580 @@ QStatusBar QLabel {{
     color: #1A1A1A;
 }}
 """
+
+
+# --- Własna obsługa Modbus master (TCP / RTU) ---
+# Zamiast pymodbus - pełna kontrola nad ramkami, dzięki czemu okno logów pokazuje dokładną transmisję
+# (także niepełne ramki, błędy CRC i spóźnione odpowiedzi). Interfejs zgodny z wcześniej używanym pymodbus.
+
+FUNCTION_NAMES = {
+    0x01: "Read Coils",
+    0x02: "Read Discrete Inputs",
+    0x03: "Read Holding Registers",
+    0x04: "Read Input Registers",
+    0x05: "Write Single Coil",
+    0x06: "Write Single Register",
+    0x0F: "Write Multiple Coils",
+    0x10: "Write Multiple Registers",
+    0x16: "Mask Write Register",
+    0x17: "Read/Write Multiple Registers",
+}
+
+EXCEPTION_NAMES = {
+    0x01: "Illegal Function",
+    0x02: "Illegal Data Address",
+    0x03: "Illegal Data Value",
+    0x04: "Slave Device Failure",
+    0x05: "Acknowledge",
+    0x06: "Slave Device Busy",
+    0x08: "Memory Parity Error",
+    0x0A: "Gateway Path Unavailable",
+    0x0B: "Gateway Target Device Failed to Respond",
+}
+
+
+class ModbusException(Exception):
+    """Błąd komunikacji Modbus (timeout, CRC, utrata połączenia, niepoprawna odpowiedź)."""
+
+
+class ModbusResponse:
+    """Odpowiedź slave'a - pola zgodne z obiektami odpowiedzi pymodbus używanymi w aplikacji."""
+    def __init__(self, function_code, registers=None, bits=None, exception_code=None):
+        self.function_code = function_code
+        self.registers = registers or []
+        self.bits = bits or []
+        self.exception_code = exception_code
+
+    def isError(self):
+        return self.exception_code is not None
+
+    def __str__(self):
+        if self.isError():
+            return (f"Exception response FC{self.function_code:02X} -> code {self.exception_code:02X} "
+                    f"({EXCEPTION_NAMES.get(self.exception_code, 'Unknown')})")
+        return f"Response FC{self.function_code:02X} ({FUNCTION_NAMES.get(self.function_code, 'Unknown')})"
+
+
+def to_hex(data):
+    return " ".join(f"{b:02X}" for b in data)
+
+def pack_bits(bits):
+    out = bytearray((len(bits) + 7) // 8)
+    for i, bit in enumerate(bits):
+        if bit:
+            out[i // 8] |= 1 << (i % 8)
+    return bytes(out)
+
+def unpack_bits(data, count):
+    return [bool((data[i // 8] >> (i % 8)) & 1) for i in range(count)]
+
+def _make_crc_table():
+    table = []
+    for i in range(256):
+        crc = i
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+        table.append(crc)
+    return table
+
+_CRC_TABLE = _make_crc_table()
+
+def crc16(data):
+    crc = 0xFFFF
+    for b in data:
+        crc = (crc >> 8) ^ _CRC_TABLE[(crc ^ b) & 0xFF]
+    return crc
+
+def crc_ok(frame):
+    return len(frame) >= 4 and crc16(frame[:-2]) == (frame[-2] | (frame[-1] << 8))
+
+def rtu_response_length(buf):
+    """Oczekiwana długość ramki odpowiedzi RTU (None - nieznana lub za mało danych)."""
+    if len(buf) < 2:
+        return None
+    fc = buf[1]
+    if fc & 0x80:
+        return 5
+    if fc in (0x01, 0x02, 0x03, 0x04, 0x17):
+        return 5 + buf[2] if len(buf) >= 3 else None
+    if fc in (0x05, 0x06, 0x0F, 0x10):
+        return 8
+    if fc == 0x16:
+        return 10
+    return None
+
+def _short_list(values, limit=16):
+    text = ", ".join(str(v) for v in values[:limit])
+    return f"[{text}{', ...' if len(values) > limit else ''}]"
+
+def describe_pdu(pdu, is_request):
+    """Czytelny opis PDU do okna logów."""
+    if not pdu:
+        return "Empty PDU"
+    fc = pdu[0]
+    if fc & 0x80:
+        code = pdu[1] if len(pdu) > 1 else 0
+        return (f"EXCEPTION FC{fc & 0x7F:02X} ({FUNCTION_NAMES.get(fc & 0x7F, 'Unknown')}) -> "
+                f"code {code:02X} {EXCEPTION_NAMES.get(code, 'Unknown')}")
+    text = f"FC{fc:02X} {FUNCTION_NAMES.get(fc, 'Unknown Function')}"
+    try:
+        if is_request:
+            if fc in (0x01, 0x02, 0x03, 0x04):
+                address, count = struct.unpack(">HH", pdu[1:5])
+                text += f" | addr={address} (0x{address:04X}) qty={count}"
+            elif fc == 0x05:
+                address, value = struct.unpack(">HH", pdu[1:5])
+                state = {0xFF00: "ON", 0x0000: "OFF"}.get(value, f"INVALID 0x{value:04X}")
+                text += f" | addr={address} (0x{address:04X}) value={state}"
+            elif fc == 0x06:
+                address, value = struct.unpack(">HH", pdu[1:5])
+                text += f" | addr={address} (0x{address:04X}) value={value} (0x{value:04X})"
+            elif fc == 0x0F:
+                address, count, byte_count = struct.unpack(">HHB", pdu[1:6])
+                bits = [int(b) for b in unpack_bits(pdu[6:6 + byte_count], count)]
+                text += f" | addr={address} (0x{address:04X}) qty={count} values={_short_list(bits, 32)}"
+            elif fc == 0x10:
+                address, count, byte_count = struct.unpack(">HHB", pdu[1:6])
+                values = list(struct.unpack(f">{byte_count // 2}H", pdu[6:6 + byte_count]))
+                text += f" | addr={address} (0x{address:04X}) qty={count} values={_short_list(values)}"
+        else:
+            if fc in (0x01, 0x02):
+                byte_count = pdu[1]
+                bits = [int(b) for b in unpack_bits(pdu[2:2 + byte_count], byte_count * 8)]
+                text += f" | {byte_count} bytes, bits={_short_list(bits, 32)}"
+            elif fc in (0x03, 0x04, 0x17):
+                byte_count = pdu[1]
+                values = list(struct.unpack(f">{byte_count // 2}H", pdu[2:2 + byte_count]))
+                text += f" | {byte_count} bytes, values={_short_list(values)}"
+            elif fc in (0x05, 0x06, 0x0F, 0x10):
+                address, value = struct.unpack(">HH", pdu[1:5])
+                label = "qty" if fc in (0x0F, 0x10) else "value"
+                text += f" | addr={address} (0x{address:04X}) {label}={value} (echo)"
+    except (struct.error, IndexError):
+        text += " | (malformed)"
+    return text
+
+
+class ModbusMasterBase:
+    """Wspólna część klientów TCP i RTU: budowa zapytań i walidacja odpowiedzi."""
+    def __init__(self, timeout=1.0, log=None):
+        self.timeout = timeout
+        self.log = log or (lambda kind, channel, data=b"", text="": None) # log(kind, channel, data, text)
+        self.connected = False
+
+    def _request(self, unit, pdu):
+        response = self._transact(unit, pdu)
+        fc = pdu[0]
+        if response[0] == fc | 0x80 and len(response) >= 2:
+            return ModbusResponse(fc, exception_code=response[1])
+        if response[0] != fc:
+            raise ModbusException(f"Unexpected function code 0x{response[0]:02X} in response (expected 0x{fc:02X})")
+        return response
+
+    def _read_bits(self, fc, address, count, unit):
+        response = self._request(unit, struct.pack(">BHH", fc, address, count))
+        if isinstance(response, ModbusResponse):
+            return response
+        if len(response) < 2 or response[1] != (count + 7) // 8 or len(response) != 2 + response[1]:
+            raise ModbusException("Malformed response (byte count does not match quantity)")
+        return ModbusResponse(fc, bits=unpack_bits(response[2:], count))
+
+    def _read_registers(self, fc, address, count, unit):
+        response = self._request(unit, struct.pack(">BHH", fc, address, count))
+        if isinstance(response, ModbusResponse):
+            return response
+        if len(response) < 2 or response[1] != 2 * count or len(response) != 2 + response[1]:
+            raise ModbusException("Malformed response (byte count does not match quantity)")
+        return ModbusResponse(fc, registers=list(struct.unpack(f">{count}H", response[2:])))
+
+    def _write(self, pdu, unit):
+        response = self._request(unit, pdu)
+        if isinstance(response, ModbusResponse):
+            return response
+        if response[:5] != pdu[:5]:
+            raise ModbusException("Write response does not echo the request")
+        return ModbusResponse(pdu[0])
+
+    # --- Interfejs zgodny z pymodbus ---
+
+    def read_coils(self, address, count=1, slave=1):
+        return self._read_bits(0x01, address, count, slave)
+
+    def read_discrete_inputs(self, address, count=1, slave=1):
+        return self._read_bits(0x02, address, count, slave)
+
+    def read_holding_registers(self, address, count=1, slave=1):
+        return self._read_registers(0x03, address, count, slave)
+
+    def read_input_registers(self, address, count=1, slave=1):
+        return self._read_registers(0x04, address, count, slave)
+
+    def write_coil(self, address, value, slave=1):
+        return self._write(struct.pack(">BHH", 0x05, address, 0xFF00 if value else 0x0000), slave)
+
+    def write_register(self, address, value, slave=1):
+        return self._write(struct.pack(">BHH", 0x06, address, value & 0xFFFF), slave)
+
+    def write_registers(self, address, values, slave=1):
+        values = [v & 0xFFFF for v in values]
+        pdu = struct.pack(f">BHHB{len(values)}H", 0x10, address, len(values), 2 * len(values), *values)
+        return self._write(pdu, slave)
+
+
+class ModbusTcpMaster(ModbusMasterBase):
+    def __init__(self, host, port=502, timeout=1.0, log=None):
+        super().__init__(timeout, log)
+        self.host = host
+        self.port = port
+        self.sock = None
+        self.next_tid = 1
+        self.channel = f"{host}:{port}"
+
+    def connect(self):
+        try:
+            self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError as e:
+            self.log("ERROR", self.channel, b"", f"Cannot connect: {e}")
+            self.sock = None
+            return False
+        self.connected = True
+        self.log("INFO", self.channel, b"", "Connected")
+        return True
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+            if self.connected:
+                self.log("INFO", self.channel, b"", "Disconnected")
+        self.connected = False
+
+    def _connection_lost(self, reason):
+        self.log("ERROR", self.channel, b"", f"{reason} - connection closed")
+        self.close()
+        raise ModbusException(f"{reason} - CLOSING CONNECTION")
+
+    def _drain(self):
+        """Usuwa dane, które przyszły bez zapytania (np. spóźniona odpowiedź po timeoucie)."""
+        stale = b""
+        self.sock.setblocking(False)
+        try:
+            while True:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    break
+                stale += chunk
+        except (BlockingIOError, InterruptedError):
+            pass
+        except OSError as e:
+            self.sock.setblocking(True)
+            self._connection_lost(f"Connection error: {e}")
+        self.sock.setblocking(True)
+        if stale:
+            self.log("ERROR", self.channel, stale, "Unexpected data received before request - discarded")
+
+    def _transact(self, unit, pdu):
+        if not self.connected:
+            raise ModbusException("Not connected")
+        self._drain()
+        tid = self.next_tid
+        self.next_tid = self.next_tid % 0xFFFF + 1
+        adu = struct.pack(">HHHB", tid, 0, len(pdu) + 1, unit) + pdu
+        try:
+            self.sock.sendall(adu)
+        except OSError as e:
+            self._connection_lost(f"Send error: {e}")
+        self.log("TX", self.channel, adu, f"TID={tid} PID=0 LEN={len(pdu) + 1} UID={unit} | {describe_pdu(pdu, True)}")
+
+        deadline = time.perf_counter() + self.timeout
+        buf = b""
+        while True:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                if buf:
+                    self.log("ERROR", self.channel, buf, "Incomplete response")
+                self.log("ERROR", self.channel, b"", f"No response within {self.timeout * 1000:.0f} ms (timeout)")
+                raise ModbusException(f"No response received within {self.timeout * 1000:.0f} ms")
+            self.sock.settimeout(remaining)
+            try:
+                chunk = self.sock.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError as e:
+                self._connection_lost(f"Connection error: {e}")
+            if not chunk:
+                self._connection_lost("Connection closed by remote device")
+            buf += chunk
+            while len(buf) >= 7:
+                r_tid, r_pid, length, r_uid = struct.unpack(">HHHB", buf[:7])
+                if not 2 <= length <= 254:
+                    self.log("ERROR", self.channel, buf, f"Invalid MBAP length field ({length}) - discarded")
+                    raise ModbusException(f"Invalid MBAP header (length {length})")
+                total = 6 + length
+                if len(buf) < total:
+                    break
+                frame, buf = buf[:total], buf[total:]
+                response = frame[7:]
+                self.log("RX", self.channel, frame,
+                         f"TID={r_tid} PID={r_pid} LEN={length} UID={r_uid} | {describe_pdu(response, False)}")
+                if r_tid != tid:
+                    self.log("ERROR", self.channel, b"", f"Unexpected transaction ID {r_tid} (expected {tid}) - discarded")
+                    continue
+                if r_uid != unit:
+                    raise ModbusException(f"Response from unit ID {r_uid}, expected {unit}")
+                if buf:
+                    self.log("ERROR", self.channel, buf, "Unexpected bytes after response - discarded")
+                return response
+
+
+class ModbusRtuMaster(ModbusMasterBase):
+    def __init__(self, port, baudrate=9600, parity="N", bytesize=8, stopbits=1, timeout=1.0, log=None):
+        super().__init__(timeout, log)
+        self.port = port
+        self.baudrate = baudrate
+        self.parity = parity
+        self.bytesize = bytesize
+        self.stopbits = stopbits
+        self.ser = None
+        self.channel = port
+        # Czas 3.5 znaku (dla > 19200 bps stała 1.75 ms wg specyfikacji)
+        bits_per_char = 1 + bytesize + (0 if parity == "N" else 1) + stopbits
+        self.t35 = 3.5 * bits_per_char / baudrate if baudrate <= 19200 else 0.00175
+        # Cisza kończąca ramkę o nieznanej długości - z zapasem na opóźnienia konwerterów USB-RS485
+        self.silence = max(self.t35, 0.03)
+        self.last_activity = 0.0
+
+    def connect(self):
+        try:
+            self.ser = serial.Serial(port=self.port, baudrate=self.baudrate, parity=self.parity,
+                                     bytesize=self.bytesize, stopbits=self.stopbits, timeout=0.005)
+        except (serial.SerialException, ValueError, OSError) as e:
+            self.log("ERROR", self.channel, b"", f"Cannot open port: {e}")
+            self.ser = None
+            return False
+        self.connected = True
+        self.log("INFO", self.channel, b"", f"Port opened: {self.baudrate} {self.bytesize}{self.parity}{self.stopbits} "
+                 f"(t3.5 = {self.t35 * 1000:.2f} ms)")
+        return True
+
+    def close(self):
+        if self.ser:
+            try:
+                self.ser.close()
+            except (serial.SerialException, OSError):
+                pass
+            self.ser = None
+            if self.connected:
+                self.log("INFO", self.channel, b"", "Port closed")
+        self.connected = False
+
+    @staticmethod
+    def _find_frame(buf):
+        """Szuka poprawnej (z CRC) ramki odpowiedzi od przesunięcia > 0."""
+        for i in range(1, len(buf) - 3):
+            n = rtu_response_length(buf[i:])
+            if n is not None and len(buf) - i >= n and crc_ok(buf[i:i + n]):
+                return i
+        return None
+
+    def _port_error(self, e):
+        self.log("ERROR", self.channel, b"", f"Serial port error: {e}")
+        self.close()
+        raise ModbusException(f"Serial port error: {e} - CLOSING CONNECTION")
+
+    def _transact(self, unit, pdu):
+        if not self.connected:
+            raise ModbusException("Not connected")
+        adu = bytes([unit]) + pdu
+        adu += crc16(adu).to_bytes(2, "little")
+        try:
+            stale = self.ser.read(self.ser.in_waiting) if self.ser.in_waiting else b""
+            if stale:
+                self.log("ERROR", self.channel, stale, "Unexpected bytes received before request - discarded")
+            gap = self.t35 - (time.perf_counter() - self.last_activity) # przerwa między ramkami >= 3.5 znaku
+            if gap > 0:
+                time.sleep(gap)
+            self.ser.write(adu)
+            self.ser.flush()
+        except (serial.SerialException, OSError) as e:
+            self._port_error(e)
+        self.last_activity = time.perf_counter()
+        self.log("TX", self.channel, adu, f"UID={unit} | {describe_pdu(pdu, True)}")
+
+        deadline = time.perf_counter() + self.timeout
+        buf = bytearray()
+        last_rx = None
+        while True:
+            try:
+                waiting = self.ser.in_waiting
+                chunk = self.ser.read(waiting if waiting else 1)
+            except (serial.SerialException, OSError) as e:
+                self._port_error(e)
+            now = time.perf_counter()
+            if chunk:
+                buf += chunk
+                last_rx = now
+                self.last_activity = now
+            expected = rtu_response_length(buf)
+            if expected is not None and len(buf) >= expected and crc_ok(buf[:expected]):
+                frame, extra = bytes(buf[:expected]), bytes(buf[expected:])
+                break
+            if (expected is None and len(buf) >= 2) or (expected is not None and len(buf) >= expected):
+                idx = self._find_frame(buf) # zakłócenia przed odpowiedzią - resynchronizacja
+                if idx is not None:
+                    self.log("ERROR", self.channel, bytes(buf[:idx]), "Discarded bytes before response")
+                    del buf[:idx]
+                    continue
+                if now - last_rx >= self.silence: # nic więcej nie nadchodzi - oceniamy to, co jest
+                    if expected is None: # nieznana długość - ramkę kończy cisza na linii
+                        frame, extra = bytes(buf), b""
+                    else:
+                        frame, extra = bytes(buf[:expected]), bytes(buf[expected:])
+                    break
+            receiving = last_rx is not None and now - last_rx < self.silence
+            if now >= deadline and not receiving: # rozpoczętą ramkę pozwalamy dokończyć
+                if buf:
+                    self.log("ERROR", self.channel, bytes(buf), "Incomplete response")
+                self.log("ERROR", self.channel, b"", f"No response within {self.timeout * 1000:.0f} ms (timeout)")
+                raise ModbusException(f"No response received within {self.timeout * 1000:.0f} ms")
+
+        if not crc_ok(frame):
+            self.log("ERROR", self.channel, frame, "Invalid CRC - response discarded")
+            raise ModbusException("CRC error in response")
+        response = frame[1:-2]
+        self.log("RX", self.channel, frame, f"UID={frame[0]} | {describe_pdu(response, False)}")
+        if extra:
+            self.log("ERROR", self.channel, extra, "Unexpected bytes after response - discarded")
+        if frame[0] != unit:
+            raise ModbusException(f"Response from slave ID {frame[0]}, expected {unit}")
+        return response
+
+
+class LogWindow(QWidget):
+    """Okno pokazujące dokładną transmisję (surowe ramki HEX + dekodowanie) - jak w pymss."""
+    COLORS = {"RX": "#0050B4", "TX": "#007A00", "INFO": "#606060", "ERROR": "#C00000"}
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.WindowType.Window)
+        self.setWindowTitle("pymms - Transmission Log")
+        self.resize(1100, 500)
+        self.entry_count = 0
+        self.dropped_count = 0
+
+        layout = QVBoxLayout(self)
+
+        options_layout = QHBoxLayout()
+        self.show_rx_cb = QCheckBox("RX")
+        self.show_tx_cb = QCheckBox("TX")
+        self.show_info_cb = QCheckBox("Info")
+        self.show_errors_cb = QCheckBox("Errors")
+        self.decode_cb = QCheckBox("Decode frames")
+        self.autoscroll_cb = QCheckBox("Auto-scroll")
+        self.pause_cb = QCheckBox("Pause")
+        for cb in (self.show_rx_cb, self.show_tx_cb, self.show_info_cb, self.show_errors_cb,
+                   self.decode_cb, self.autoscroll_cb):
+            cb.setChecked(True)
+        for cb in (self.show_rx_cb, self.show_tx_cb, self.show_info_cb, self.show_errors_cb):
+            options_layout.addWidget(cb)
+        options_layout.addSpacing(20)
+        options_layout.addWidget(self.decode_cb)
+        options_layout.addWidget(self.autoscroll_cb)
+        options_layout.addWidget(self.pause_cb)
+        options_layout.addSpacing(20)
+        options_layout.addWidget(QLabel("Max lines:"))
+        self.max_lines_sb = QSpinBox()
+        self.max_lines_sb.setRange(100, 1000000)
+        self.max_lines_sb.setSingleStep(1000)
+        self.max_lines_sb.setValue(20000)
+        self.max_lines_sb.valueChanged.connect(lambda v: self.text.setMaximumBlockCount(v))
+        options_layout.addWidget(self.max_lines_sb)
+        options_layout.addStretch()
+        self.clear_btn = QPushButton("Clear")
+        self.clear_btn.clicked.connect(self.clear)
+        options_layout.addWidget(self.clear_btn)
+        self.save_btn = QPushButton("Save...")
+        self.save_btn.clicked.connect(self.save)
+        options_layout.addWidget(self.save_btn)
+        layout.addLayout(options_layout)
+
+        self.text = QPlainTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.text.setMaximumBlockCount(self.max_lines_sb.value())
+        font = QFont("Consolas")
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        font.setPointSize(9)
+        self.text.setFont(font)
+        layout.addWidget(self.text)
+
+        self.info_label = QLabel()
+        self.info_label.setStyleSheet(f"background-color: {ACCENT}; color: #1A1A1A; padding: 3px 6px;")
+        layout.addWidget(self.info_label)
+        self.update_info()
+
+        self.formats = {}
+        for kind, color in self.COLORS.items():
+            fmt = QTextCharFormat()
+            fmt.setForeground(QColor(color))
+            self.formats[kind] = fmt
+
+    def update_info(self):
+        text = f"Entries: {self.entry_count}"
+        if self.dropped_count:
+            text += f" | Skipped while paused: {self.dropped_count}"
+        self.info_label.setText(text)
+
+    def add_entry(self, entry):
+        timestamp, kind, channel, data, text = entry
+        if self.pause_cb.isChecked():
+            self.dropped_count += 1
+            self.update_info()
+            return
+        visible = {"RX": self.show_rx_cb, "TX": self.show_tx_cb,
+                   "INFO": self.show_info_cb, "ERROR": self.show_errors_cb}[kind].isChecked()
+        if not visible:
+            return
+
+        line = f"{timestamp:%H:%M:%S}.{timestamp.microsecond // 1000:03d}  {kind:<5} [{channel}]"
+        if data:
+            line += f"  ({len(data):>3} B)  {to_hex(data)}"
+            if self.decode_cb.isChecked() and text:
+                line += f"\n{'':<20}-> {text}" # dekodowanie w osobnej, wciętej linii
+        else:
+            line += f"  {text}"
+
+        cursor = QTextCursor(self.text.document())
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if not self.text.document().isEmpty():
+            cursor.insertBlock()
+        cursor.insertText(line, self.formats[kind])
+        if self.autoscroll_cb.isChecked():
+            bar = self.text.verticalScrollBar()
+            bar.setValue(bar.maximum())
+        self.entry_count += 1
+        self.update_info()
+
+    def clear(self):
+        self.text.clear()
+        self.entry_count = 0
+        self.dropped_count = 0
+        self.update_info()
+
+    def save(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Transmission Log", f"pymms_log_{datetime.now():%Y%m%d_%H%M%S}.txt",
+            "Text files (*.txt *.log);;All files (*)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.text.toPlainText())
+        except OSError as e:
+            QMessageBox.critical(self, "Save Error", f"Cannot save log file: {e}")
 
 
 # --- Funkcje pomocnicze do konwersji danych ---
@@ -312,7 +883,7 @@ class ModbusValueEditor(QDialog):
 
 class ModbusClientApp(QMainWindow):
     # Wersja aplikacji, która będzie inkrementowana
-    __version__ = "1.11"
+    __version__ = "1.12"
 
     def __init__(self):
         super().__init__()
@@ -331,6 +902,7 @@ class ModbusClientApp(QMainWindow):
 
         self.modbus_client = None
         self.connection_type = "RTU" # Default connection type
+        self.log_window = LogWindow(self) # Okno logów transmisji
 
         # Initialize button attributes before calling init_ui
         self.connect_btn = None
@@ -407,7 +979,7 @@ class ModbusClientApp(QMainWindow):
         self.tcp_params_widget = QWidget() # New widget for TCP parameters
         self.tcp_params_layout = QHBoxLayout(self.tcp_params_widget) # Set layout for this widget
         self.tcp_params_layout.addWidget(QLabel("IP Address:"))
-        self.ip_address_le = QLineEdit("127.0.0.1")
+        self.ip_address_le = QLineEdit("192.168.1.1")
         self.tcp_params_layout.addWidget(self.ip_address_le)
         self.tcp_params_layout.addWidget(QLabel("Port:"))
         self.port_le = QLineEdit("502")
@@ -421,7 +993,7 @@ class ModbusClientApp(QMainWindow):
         connection_layout.addWidget(QLabel("Timeout (ms):"))
         self.timeout_ms_sb = QSpinBox()
         self.timeout_ms_sb.setRange(100, 30000) # 100ms to 30 seconds
-        self.timeout_ms_sb.setValue(1000) # Default 1 second
+        self.timeout_ms_sb.setValue(500) # Default 1 second
         connection_layout.addWidget(self.timeout_ms_sb)
 
         # Connection Buttons
@@ -476,6 +1048,10 @@ class ModbusClientApp(QMainWindow):
         self.read_data_btn.setEnabled(False) # Set initial state
         read_params_layout.addWidget(self.read_data_btn)
         read_params_layout.addStretch() # Stretch to push buttons to the right
+
+        self.show_log_btn = QPushButton("Transmission Log")
+        self.show_log_btn.clicked.connect(self.show_log_window)
+        read_params_layout.addWidget(self.show_log_btn)
 
         rw_layout.addLayout(read_params_layout)
 
@@ -672,30 +1248,31 @@ class ModbusClientApp(QMainWindow):
                 parity = self.parity_cb.currentText()
                 data_bits = int(self.data_bits_cb.currentText())
                 stop_bits = int(self.stop_bits_cb.currentText())
-                self.modbus_client = ModbusSerialClient(
+                self.modbus_client = ModbusRtuMaster(
                     port=port,
                     baudrate=baudrate,
                     parity=parity,
                     bytesize=data_bits,
                     stopbits=stop_bits,
                     timeout=timeout_seconds, # Use new timeout
-                    retries=0 # Set retries to 0 to prevent automatic retries
+                    log=self.log
                 )
             else: # TCP
                 host = self.ip_address_le.text()
                 port = int(self.port_le.text())
-                self.modbus_client = ModbusTcpClient(
+                self.modbus_client = ModbusTcpMaster(
                     host=host,
                     port=port,
                     timeout=timeout_seconds, # Use new timeout
-                    retries=0 # Set retries to 0 to prevent automatic retries
+                    log=self.log
                 )
 
             if self.modbus_client.connect():
                 self.status_message_label.setText(f"Connected to Modbus ({self.connection_type}).")
                 self.status_message_label.setStyleSheet("") # Reset color on success
             else:
-                self.status_message_label.setText(f"Connection error with Modbus ({self.connection_type}). Check parameters.")
+                self.status_message_label.setText(f"Connection error with Modbus ({self.connection_type}). "
+                                                  "Check parameters (details in Transmission Log).")
                 self.status_message_label.setStyleSheet(f"color: {STATUS_RED};") # Set color to red on error
                 self.modbus_client = None # Reset client on error
         except Exception as e:
@@ -856,6 +1433,7 @@ class ModbusClientApp(QMainWindow):
             if "CLOSING CONNECTION" in error_message or "timed out" in error_message:
                 if self.polling_timer.isActive():
                     self.stop_cyclic_read()
+                self.update_connection_buttons() # po utracie połączenia odblokuj "Connect"
             return # Nie kontynuujemy wyświetlania rejestrów w przypadku błędu
 
         except Exception as e: # Catch any other unexpected errors
@@ -1120,6 +1698,7 @@ class ModbusClientApp(QMainWindow):
             QMessageBox.critical(self, "Modbus Error", f"Modbus communication error during write: {e}")
             self.status_message_label.setText(f"Modbus communication error during write: {e}")
             self.status_message_label.setStyleSheet(f"color: {STATUS_RED};")
+            self.update_connection_buttons()
         except ValueError as e:
             QMessageBox.critical(self, "Value Error", f"Entered value is not valid for the selected type: {e}")
             self.status_message_label.setText(f"Error: Entered value is not valid: {e}")
@@ -1128,6 +1707,24 @@ class ModbusClientApp(QMainWindow):
             QMessageBox.critical(self, "Error", f"An unexpected error occurred during write: {e}")
             self.status_message_label.setText(f"Unexpected write error: {e}")
             self.status_message_label.setStyleSheet(f"color: {STATUS_RED};")
+
+    # --- Okno logów transmisji ---
+
+    def log(self, kind, channel, data=b"", text=""):
+        """Wpis do okna logów (wywoływany przez klienta Modbus w wątku GUI)."""
+        self.log_window.add_entry((datetime.now(), kind, channel, bytes(data), text))
+
+    def show_log_window(self):
+        self.log_window.show()
+        self.log_window.raise_()
+        self.log_window.activateWindow()
+
+    def closeEvent(self, event):
+        self.polling_timer.stop()
+        if self.modbus_client:
+            self.modbus_client.close()
+        self.log_window.close()
+        super().closeEvent(event)
 
 
 if __name__ == "__main__":
