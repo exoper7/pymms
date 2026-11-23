@@ -19,8 +19,9 @@ pymms bez fizycznego urządzenia.
   z kolejnością bajtów ABCD / CDAB / BADC / DCBA.
 - **Zapis** wartości dwuklikiem w tabeli: 0x05 dla coili, 0x06 dla rejestrów 16-bitowych, 0x10 dla 32- i 64-bitowych.
 - **Cykliczny odczyt** z ustawianym interwałem.
-- **Okno logów transmisji** – każda wysłana i odebrana ramka w HEX z dekodowaniem, a także timeouty, błędy CRC,
+- **Log transmisji** – każda wysłana i odebrana ramka w HEX z dekodowaniem, a także timeouty, błędy CRC,
   niepełne i spóźnione odpowiedzi.
+- **Wykres** wybranych rejestrów w czasie, z eksportem danych do CSV i obrazu do PNG.
 - **Skaner** – wyszukiwanie urządzeń w zakresie Slave ID albo rejestrów w zakresie adresów, z eksportem wyników
   do pliku CSV gotowego do wczytania w pymss.
 - Statystyki: liczba odpytań, liczba błędów, czas ostatniej odpowiedzi i średni czas odpowiedzi.
@@ -174,6 +175,38 @@ Wiersze są kolorowane według wyniku: zielony – odpowiedź z danymi, pomarań
 
 **Export CSV...** zapisuje udane odczyty jako mapę rejestrów w formacie pymss (UINT16 dla rejestrów, BOOL dla
 bitów). Taki plik można od razu wczytać w pymss przez **Import CSV...** i zasymulować zeskanowane urządzenie.
+
+### 8. Wykres
+
+Wykres pokazuje, jak zmieniają się wybrane rejestry w czasie.
+
+**Dodawanie rejestrów:** zaznacz jeden lub kilka wierszy w tabeli wyników, kliknij prawym przyciskiem myszy i wybierz
+**Add to chart**. Otworzy się okno wykresu, a rejestry dostaną w tabeli kolorową kropkę w kolorze swojej serii.
+Przycisk **Chart** na drugim pasku otwiera okno w dowolnym momencie.
+
+**Próbkowanie:** nowa próbka zapisuje się przy każdym udanym odczycie, zarówno ręcznym (**Read**), jak i cyklicznym
+(**Cyclic read**). Rozdzielczość wykresu to więc interwał odczytu cyklicznego.
+
+![Wykres](docs/pymms_chart.png)
+
+**Identyfikacja serii:** serię wyznaczają Slave ID, funkcja, adres, typ danych i kolejność bajtów, np.
+`ID1 HR 1 FLOAT32 CDAB`. Dzięki temu można rysować rejestry z różnych zapytań. Gdy zmienisz zakres lub typ odczytu,
+serie, których nie ma w bieżącej tabeli, po prostu nie dostają nowych próbek, a linia ma w tym miejscu przerwę.
+
+| Element | Opis |
+|---|---|
+| **Time window** | Zakres osi czasu: 30 s, 1 min, 5 min, 15 min, 1 h albo **All** (cała historia). Wykres przesuwa się za najnowszą próbką. |
+| **Pause** | Wstrzymuje zapisywanie nowych próbek; odczyty trwają dalej |
+| Lista **SERIES** | Checkbox pokazuje lub ukrywa serię, prawy klik lub **Remove selected** usuwa serię |
+| Kursor nad wykresem | Pionowa linia i wartości wszystkich serii w danej chwili |
+| **Clear data** | Usuwa zapisane próbki, zostawia serie |
+| **Export CSV** | Zapisuje wszystkie próbki (cała historia, niezależnie od zakresu osi) |
+| **Export PNG** | Zapisuje obraz wykresu z legendą |
+
+Plik CSV z wykresu (separator `;`) ma jeden wiersz na chwilę odczytu. Kolumny to `timestamp` (data i czas
+z milisekundami), `unix_time` oraz po jednej kolumnie na serię. Puste pole oznacza, że w tym odczycie seria nie
+była odczytywana. Oś Y skaluje się automatycznie do widocznych serii. Przy seriach o bardzo różnych zakresach
+wartości warto ukryć część z nich. W pamięci trzymane jest do 200 000 próbek na serię, a najstarsze są usuwane.
 
 ## Kolejność bajtów
 

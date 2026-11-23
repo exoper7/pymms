@@ -1,6 +1,8 @@
 import sys
 import os
 import csv
+import math
+import bisect
 import socket
 import tempfile
 import struct
@@ -11,10 +13,11 @@ from datetime import datetime
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFrame, QSplitter,
     QGroupBox, QLineEdit, QPushButton, QToolButton, QButtonGroup, QComboBox, QLabel, QCheckBox,
+    QListWidget, QListWidgetItem, QMenu,
     QTableWidget, QTableWidgetItem, QDialog, QDialogButtonBox,
     QMessageBox, QSpinBox, QPlainTextEdit, QFileDialog, QProgressBar, QAbstractItemView
 )
-from PyQt6.QtCore import Qt, QTimer, QRect, QSettings, QStandardPaths, QPointF
+from PyQt6.QtCore import Qt, QTimer, QRect, QRectF, QSettings, QStandardPaths, QPointF
 from PyQt6.QtGui import (
     QIcon, QColor, QFont, QFontDatabase, QPainter, QPalette, QPen, QPixmap, QPolygonF, QTextCursor, QTextCharFormat
 )
@@ -265,6 +268,7 @@ def icon(glyph, color=C_TEXT, size=16):
 
 G_REFRESH, G_PLAY, G_STOP, G_DELETE, G_SAVE = "", "", "", "", ""
 G_SEARCH, G_DOWN, G_PLUG, G_SYNC, G_LIST, G_PAUSE = "", "", "", "", "", ""
+G_CHART = "\ue9d2"
 
 
 def mono_family():
@@ -1409,6 +1413,440 @@ class ScannerWindow(QWidget):
         super().closeEvent(event)
 
 
+CHART_COLORS = [ACCENT, "#58a6ff", "#f2b43c", "#ff7ab6", "#a58bff", "#39c5cf", "#ff5f5f", "#e3d74c", "#4cc38a", "#ff9f5a"]
+CHART_MAX_POINTS = 200_000   # limit próbek na serię (najstarsze są usuwane)
+CHART_WINDOWS = [("30 s", 30), ("1 min", 60), ("5 min", 300), ("15 min", 900), ("1 h", 3600), ("All", None)]
+
+
+def dot_icon(color, size=10):
+    pm = QPixmap(size * 2, size * 2)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(color))
+    p.drawEllipse(2, 2, size * 2 - 4, size * 2 - 4)
+    p.end()
+    pm.setDevicePixelRatio(2)
+    return QIcon(pm)
+
+
+def nice_step(span, max_ticks):
+    """Krok podziałki 1/2/5 x 10^n, tak aby było co najwyżej max_ticks podziałek."""
+    raw = span / max(max_ticks, 1)
+    magnitude = 10 ** math.floor(math.log10(raw)) if raw > 0 else 1
+    for m in (1, 2, 5, 10):
+        if raw <= m * magnitude:
+            return m * magnitude
+    return 10 * magnitude
+
+
+def format_number(value, step=None):
+    if step is not None and step < 1:
+        decimals = min(6, max(0, -int(math.floor(math.log10(step)))))
+        return f"{value:.{decimals}f}"
+    if abs(value) >= 1e7:
+        return f"{value:.3g}"
+    return f"{value:.0f}" if float(value).is_integer() else f"{value:.4g}"
+
+
+class ChartSeries:
+    def __init__(self, key, label, color):
+        self.key = key
+        self.label = label
+        self.color = color
+        self.visible = True
+        self.times = []   # osobne listy - szybkie wyszukiwanie (bisect) po czasie
+        self.values = []
+
+    def add(self, t, v):
+        self.times.append(t)
+        self.values.append(v)
+        if len(self.times) > CHART_MAX_POINTS:
+            del self.times[:CHART_MAX_POINTS // 10]
+            del self.values[:CHART_MAX_POINTS // 10]
+
+    def value_at(self, t):
+        """Ostatnia próbka nie późniejsza niż t."""
+        i = bisect.bisect_right(self.times, t) - 1
+        return (self.times[i], self.values[i]) if i >= 0 else None
+
+
+class PlotWidget(QWidget):
+    """Wykres liniowy wartości w czasie (QPainter, bez zewnętrznych bibliotek)."""
+    MARGIN_LEFT, MARGIN_RIGHT, MARGIN_TOP, MARGIN_BOTTOM = 72, 18, 14, 30
+
+    def __init__(self, chart):
+        super().__init__()
+        self.chart = chart
+        self.hover_x = None
+        self.setMouseTracking(True)
+        self.setMinimumSize(420, 260)
+
+    def time_range(self):
+        series = [s for s in self.chart.series if s.times]
+        if not series:
+            now = time.time()
+            return now - 60, now
+        end = max(s.times[-1] for s in series)
+        window = self.chart.window_seconds()
+        if window is None:
+            start = min(s.times[0] for s in series)
+            if end - start < 1:
+                start = end - 1
+        else:
+            start = end - window
+        return start, end
+
+    def value_range(self, t0, t1):
+        lo, hi = None, None
+        for s in self.chart.series:
+            if not s.visible or not s.times:
+                continue
+            i0 = max(bisect.bisect_left(s.times, t0) - 1, 0)
+            i1 = bisect.bisect_right(s.times, t1)
+            chunk = s.values[i0:i1]
+            if chunk:
+                lo = min(chunk) if lo is None else min(lo, min(chunk))
+                hi = max(chunk) if hi is None else max(hi, max(chunk))
+        if lo is None:
+            return 0.0, 1.0
+        if hi - lo < 1e-12:
+            pad = max(abs(hi) * 0.05, 1.0)
+            return lo - pad, hi + pad
+        pad = (hi - lo) * 0.06
+        return lo - pad, hi + pad
+
+    def plot_rect(self):
+        return QRectF(self.MARGIN_LEFT, self.MARGIN_TOP, self.width() - self.MARGIN_LEFT - self.MARGIN_RIGHT,
+                      self.height() - self.MARGIN_TOP - self.MARGIN_BOTTOM)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.paint_chart(p, self.rect())
+        p.end()
+
+    def paint_chart(self, p, rect):
+        p.fillRect(rect, QColor(C_BG))
+        r = self.plot_rect()
+        t0, t1 = self.time_range()
+        v0, v1 = self.value_range(t0, t1)
+        tx = lambda t: r.left() + (t - t0) / (t1 - t0) * r.width()
+        vy = lambda v: r.bottom() - (v - v0) / (v1 - v0) * r.height()
+        small = QFont("Segoe UI")
+        small.setPointSizeF(8)
+        p.setFont(small)
+
+        # siatka i oś Y
+        grid_pen = QPen(QColor(C_BORDER), 1)
+        step = nice_step(v1 - v0, max(int(r.height() / 38), 2))
+        v = math.ceil(v0 / step) * step
+        while v <= v1:
+            y = vy(v)
+            p.setPen(grid_pen)
+            p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
+            p.setPen(QColor(C_MUTED))
+            p.drawText(QRectF(0, y - 8, r.left() - 8, 16),
+                       Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, format_number(v, step))
+            v += step
+        # oś X (czas)
+        span = t1 - t0
+        max_ticks = max(int(r.width() / 95), 2)
+        tstep = next((s for s in (1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 14400)
+                      if span / s <= max_ticks), 28800)
+        t = math.ceil(t0 / tstep) * tstep
+        while t <= t1:
+            x = tx(t)
+            p.setPen(grid_pen)
+            p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
+            p.setPen(QColor(C_MUTED))
+            p.drawText(QRectF(x - 40, r.bottom() + 6, 80, 16), Qt.AlignmentFlag.AlignCenter,
+                       time.strftime("%H:%M:%S", time.localtime(t)))
+            t += tstep
+        p.setPen(QPen(QColor("#3a404b"), 1))
+        p.drawRect(r)
+
+        # serie
+        p.save()
+        p.setClipRect(r)
+        for s in self.chart.series:
+            if not s.visible or not s.times:
+                continue
+            i0 = max(bisect.bisect_left(s.times, t0) - 1, 0)
+            i1 = bisect.bisect_right(s.times, t1)
+            pts = [QPointF(tx(s.times[i]), vy(s.values[i])) for i in range(i0, i1)]
+            if not pts:
+                continue
+            color = QColor(s.color)
+            p.setPen(QPen(color, 1.7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            # linia jest przerywana tam, gdzie seria nie była odczytywana (luka > 5x typowy odstęp próbek)
+            gaps = sorted(s.times[i + 1] - s.times[i] for i in range(i0, i1 - 1))
+            max_gap = max(5 * gaps[len(gaps) // 2], 1.0) if gaps else None
+            s.max_gap = max_gap # używane też przez podgląd pod kursorem
+            segment = pts[:1]
+            for k in range(1, len(pts)):
+                if s.times[i0 + k] - s.times[i0 + k - 1] > max_gap:
+                    if len(segment) > 1:
+                        p.drawPolyline(QPolygonF(segment))
+                    segment = []
+                segment.append(pts[k])
+            if len(segment) > 1:
+                p.drawPolyline(QPolygonF(segment))
+            if len(pts) <= 80: # przy małej liczbie próbek pokaż punkty pomiarowe
+                p.setBrush(color)
+                for pt in pts:
+                    p.drawEllipse(pt, 2.3, 2.3)
+                p.setBrush(Qt.BrushStyle.NoBrush)
+        p.restore()
+
+        # legenda
+        visible = [s for s in self.chart.series if s.visible]
+        if visible:
+            fm = p.fontMetrics()
+            width = max(fm.horizontalAdvance(s.label) for s in visible) + 34
+            box = QRectF(r.left() + 8, r.top() + 8, width, 8 + 16 * len(visible))
+            p.setPen(QPen(QColor(C_BORDER), 1))
+            p.setBrush(QColor(27, 30, 36, 220))
+            p.drawRoundedRect(box, 6, 6)
+            for i, s in enumerate(visible):
+                y = box.top() + 12 + 16 * i
+                p.setPen(QPen(QColor(s.color), 2.2))
+                p.drawLine(QPointF(box.left() + 8, y), QPointF(box.left() + 22, y))
+                p.setPen(QColor(C_TEXT))
+                p.drawText(QPointF(box.left() + 28, y + 4), s.label)
+        elif not self.chart.series:
+            p.setPen(QColor(C_DIM))
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter,
+                       "No series yet.\nRight-click rows in the results table and choose \"Add to chart\".")
+
+        # kursor: pionowa linia i wartości w chwili wskazanej myszą
+        if self.hover_x is not None and r.left() <= self.hover_x <= r.right() and visible:
+            t = t0 + (self.hover_x - r.left()) / r.width() * (t1 - t0)
+            p.setPen(QPen(QColor(C_MUTED), 1, Qt.PenStyle.DashLine))
+            p.drawLine(QPointF(self.hover_x, r.top()), QPointF(self.hover_x, r.bottom()))
+            lines = [(C_MUTED, time.strftime("%H:%M:%S", time.localtime(t)) + f".{int((t % 1) * 1000):03d}")]
+            for s in visible:
+                sample = s.value_at(t)
+                max_gap = getattr(s, "max_gap", None)
+                if sample is not None and (max_gap is None or t - sample[0] <= max_gap): # w luce - brak wartości
+                    lines.append((s.color, f"{s.label}:  {format_number(sample[1])}"))
+                    p.setPen(Qt.PenStyle.NoPen)
+                    p.setBrush(QColor(s.color))
+                    p.drawEllipse(QPointF(tx(sample[0]), vy(sample[1])), 3.5, 3.5)
+            fm = p.fontMetrics()
+            width = max(fm.horizontalAdvance(text) for _, text in lines) + 16
+            height = 8 + 16 * len(lines)
+            x = self.hover_x + 12 if self.hover_x + 12 + width < r.right() else self.hover_x - 12 - width
+            box = QRectF(x, r.top() + 8, width, height)
+            p.setPen(QPen(QColor(C_BORDER), 1))
+            p.setBrush(QColor(C_PANEL2))
+            p.drawRoundedRect(box, 6, 6)
+            for i, (color, text) in enumerate(lines):
+                p.setPen(QColor(color if i else C_MUTED))
+                p.drawText(QPointF(box.left() + 8, box.top() + 16 + 16 * i), text)
+
+    def mouseMoveEvent(self, event):
+        self.hover_x = event.position().x()
+        self.update()
+
+    def leaveEvent(self, event):
+        self.hover_x = None
+        self.update()
+
+
+class ChartWindow(QWidget):
+    """Wykres wybranych rejestrów - próbki dodawane przy każdym odczycie (ręcznym i cyklicznym)."""
+    ROLE_KEY = Qt.ItemDataRole.UserRole
+
+    def __init__(self, app_window):
+        super().__init__(app_window, Qt.WindowType.Window)
+        self.app_window = app_window
+        self.setWindowTitle("pymms - Chart")
+        self.setWindowIcon(app_window.windowIcon())
+        self.resize(1100, 560)
+        self.series = []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        bar = QFrame(objectName="panelbar")
+        bl = QHBoxLayout(bar)
+        bl.setContentsMargins(14, 8, 14, 8)
+        bl.setSpacing(6)
+        bl.addWidget(QLabel("CHART", objectName="sectionTitle"))
+        bl.addSpacing(10)
+        bl.addWidget(QLabel("Time window", objectName="fieldLabel"))
+        self.window_cb = QComboBox()
+        for label, seconds in CHART_WINDOWS:
+            self.window_cb.addItem(label, seconds)
+        self.window_cb.setCurrentIndex(1)
+        self.window_cb.currentIndexChanged.connect(lambda: self.plot.update())
+        bl.addWidget(self.window_cb)
+        self.pause_btn = QPushButton("Pause", checkable=True, icon=icon(G_PAUSE),
+                                     toolTip="Stop recording new samples (reads continue)")
+        bl.addWidget(self.pause_btn)
+        bl.addStretch(1)
+        self.info_label = QLabel(objectName="hint")
+        bl.addWidget(self.info_label)
+        bl.addSpacing(6)
+        self.clear_btn = QPushButton("Clear data", icon=icon(G_DELETE), toolTip="Remove recorded samples, keep series")
+        self.clear_btn.clicked.connect(self.clear_data)
+        bl.addWidget(self.clear_btn)
+        self.csv_btn = QPushButton("Export CSV", icon=icon(G_SAVE), toolTip="Save all recorded samples to CSV")
+        self.csv_btn.clicked.connect(self.export_csv)
+        bl.addWidget(self.csv_btn)
+        self.png_btn = QPushButton("Export PNG", icon=icon(G_SAVE), toolTip="Save the chart as an image")
+        self.png_btn.clicked.connect(self.export_png)
+        bl.addWidget(self.png_btn)
+        layout.addWidget(bar)
+
+        split = QSplitter(Qt.Orientation.Horizontal, childrenCollapsible=False)
+        side = QFrame(objectName="sidebar")
+        side.setMinimumWidth(210)
+        sl = QVBoxLayout(side)
+        sl.setContentsMargins(12, 12, 12, 10)
+        sl.setSpacing(6)
+        sl.addWidget(QLabel("SERIES", objectName="sectionTitle"))
+        self.series_list = QListWidget()
+        self.series_list.setToolTip("Click the checkbox to show/hide · Right-click to remove")
+        self.series_list.itemChanged.connect(self.on_item_changed)
+        self.series_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.series_list.customContextMenuRequested.connect(self.series_menu)
+        sl.addWidget(self.series_list, 1)
+        self.remove_btn = QPushButton("Remove selected", icon=icon(G_DELETE))
+        self.remove_btn.clicked.connect(lambda: self.remove_keys([i.data(self.ROLE_KEY) for i in self.series_list.selectedItems()]))
+        sl.addWidget(self.remove_btn)
+        hint = QLabel("Add series: right-click rows in the results table and choose \"Add to chart\". "
+                      "Samples are recorded on every read.", objectName="hint")
+        hint.setWordWrap(True)
+        sl.addWidget(hint)
+        split.addWidget(side)
+        self.plot = PlotWidget(self)
+        split.addWidget(self.plot)
+        split.setStretchFactor(1, 1)
+        split.setSizes([230, 870])
+        layout.addWidget(split, 1)
+        self.update_info()
+
+    def window_seconds(self):
+        return self.window_cb.currentData()
+
+    # --- Serie ---
+
+    def find(self, key):
+        return next((s for s in self.series if s.key == key), None)
+
+    def has_series(self, key):
+        return self.find(key) is not None
+
+    def series_color(self, key):
+        s = self.find(key)
+        return s.color if s else None
+
+    def add_series(self, key, label):
+        if self.has_series(key):
+            return
+        used = {s.color for s in self.series}
+        color = next((c for c in CHART_COLORS if c not in used), CHART_COLORS[len(self.series) % len(CHART_COLORS)])
+        self.series.append(ChartSeries(key, label, color))
+        item = QListWidgetItem(dot_icon(color), label)
+        item.setData(self.ROLE_KEY, key)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Checked)
+        self.series_list.addItem(item)
+        self.update_info()
+        self.plot.update()
+
+    def remove_keys(self, keys):
+        keys = set(keys)
+        self.series = [s for s in self.series if s.key not in keys]
+        for row in reversed(range(self.series_list.count())):
+            if self.series_list.item(row).data(self.ROLE_KEY) in keys:
+                self.series_list.takeItem(row)
+        self.update_info()
+        self.plot.update()
+        self.app_window.style_result_rows()
+
+    def on_item_changed(self, item):
+        s = self.find(item.data(self.ROLE_KEY))
+        if s:
+            s.visible = item.checkState() == Qt.CheckState.Checked
+            self.plot.update()
+
+    def series_menu(self, pos):
+        item = self.series_list.itemAt(pos)
+        menu = QMenu(self)
+        if item:
+            menu.addAction("Remove", lambda: self.remove_keys([item.data(self.ROLE_KEY)]))
+        menu.addAction("Remove all", lambda: self.remove_keys([s.key for s in self.series]))
+        menu.exec(self.series_list.mapToGlobal(pos))
+
+    # --- Dane ---
+
+    def add_samples(self, t, values):
+        """values: {klucz serii: wartość} z jednego odczytu."""
+        if self.pause_btn.isChecked() or not values:
+            return
+        for key, value in values.items():
+            s = self.find(key)
+            if s:
+                s.add(t, value)
+        self.update_info()
+        if self.isVisible():
+            self.plot.update()
+
+    def clear_data(self):
+        for s in self.series:
+            s.times.clear()
+            s.values.clear()
+        self.update_info()
+        self.plot.update()
+
+    def update_info(self):
+        samples = sum(len(s.times) for s in self.series)
+        self.info_label.setText(f"{len(self.series)} series  ·  {samples:,} samples".replace(",", " "))
+
+    def export_csv(self):
+        """Wszystkie zapisane próbki: wiersz = chwila odczytu, kolumna = seria (puste pole - brak próbki)."""
+        if not any(s.times for s in self.series):
+            QMessageBox.information(self, "Export CSV", "No samples to export.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export Chart Data", f"chart_{datetime.now():%Y%m%d_%H%M%S}.csv",
+                                              "CSV files (*.csv);;All files (*)")
+        if not path:
+            return
+        rows = {}
+        for col, s in enumerate(self.series):
+            for t, v in zip(s.times, s.values):
+                rows.setdefault(t, [""] * len(self.series))[col] = format_number(v)
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f, delimiter=";")
+                writer.writerow(["timestamp", "unix_time"] + [s.label for s in self.series])
+                for t in sorted(rows):
+                    stamp = datetime.fromtimestamp(t).isoformat(sep=" ", timespec="milliseconds")
+                    writer.writerow([stamp, f"{t:.3f}"] + rows[t])
+        except OSError as e:
+            QMessageBox.critical(self, "Export CSV", f"Cannot write file: {e}")
+            return
+        self.info_label.setText(f"Exported {len(rows)} rows to {os.path.basename(path)}")
+
+    def export_png(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export Chart Image", f"chart_{datetime.now():%Y%m%d_%H%M%S}.png",
+                                              "PNG images (*.png);;All files (*)")
+        if not path:
+            return
+        hover, self.plot.hover_x = self.plot.hover_x, None # bez kursora na obrazku
+        ok = self.plot.grab().save(path, "PNG")
+        self.plot.hover_x = hover
+        if not ok:
+            QMessageBox.critical(self, "Export PNG", f"Cannot write file: {path}")
+            return
+        self.info_label.setText(f"Saved {os.path.basename(path)}")
+
+
 class ModbusValueEditor(QDialog):
     """Dialog to edit register value."""
     def __init__(self, current_value, register_address, data_type, parent=None):
@@ -1473,7 +1911,7 @@ class ModbusValueEditor(QDialog):
 
 class ModbusClientApp(QMainWindow):
     # Wersja aplikacji, która będzie inkrementowana
-    __version__ = "1.16"
+    __version__ = "1.17"
 
     FUNCTIONS = ["0x03 (Holding Registers)", "0x04 (Input Registers)", "0x01 (Coils)", "0x02 (Discrete Inputs)"]
     DATA_TYPES = ["UINT16 (16-bit Unsigned)", "INT16 (16-bit Signed)",
@@ -1492,6 +1930,8 @@ class ModbusClientApp(QMainWindow):
         self.modbus_client = None
         self.connection_type = "RTU" # Default connection type
         self.scanner_window = None # Okno skanera (tworzone przy pierwszym otwarciu)
+        self.chart_window = None # Okno wykresu (tworzone przy pierwszym użyciu)
+        self.last_read_params = None # parametry ostatniego udanego odczytu - identyfikują serie wykresu
         self.polling_timer = QTimer(self) # Initialize QTimer
         self.polling_timer.timeout.connect(self.read_modbus_data) # Connect timer to read function
 
@@ -1657,6 +2097,9 @@ class ModbusClientApp(QMainWindow):
         self.show_scanner_btn = QPushButton("Scanner", icon=icon(G_SEARCH), toolTip="Scan Slave IDs or register addresses")
         self.show_scanner_btn.clicked.connect(self.show_scanner_window)
         ql.addWidget(self.show_scanner_btn)
+        self.show_chart_btn = QPushButton("Chart", icon=icon(G_CHART), toolTip="Plot selected registers over time")
+        self.show_chart_btn.clicked.connect(self.show_chart_window)
+        ql.addWidget(self.show_chart_btn)
         self.show_log_btn = QPushButton("Log", checkable=True, checked=True, icon=icon(G_LIST),
                                         toolTip="Show / hide the transmission log")
         self.show_log_btn.toggled.connect(self.on_log_toggled)
@@ -1711,6 +2154,9 @@ class ModbusClientApp(QMainWindow):
         self.registers_table.setColumnCount(5)
         self.registers_table.setHorizontalHeaderLabels(["REGISTER", "REGISTER (HEX)", "RAW VALUE", "VALUE", "TYPE"])
         self.registers_table.cellDoubleClicked.connect(self.on_table_double_click)
+        self.registers_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.registers_table.customContextMenuRequested.connect(self.table_context_menu)
+        self.registers_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.registers_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.registers_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.registers_table.setAlternatingRowColors(True)
@@ -1952,6 +2398,12 @@ class ModbusClientApp(QMainWindow):
                 item = self.registers_table.item(row, col)
                 if item and color is not None:
                     item.setForeground(color)
+            # kolorowa kropka przy rejestrach rysowanych na wykresie
+            item = self.registers_table.item(row, 0)
+            if item:
+                key = self.row_series_key(row)
+                color = self.chart_window.series_color(key) if self.chart_window and key else None
+                item.setIcon(dot_icon(color) if color else QIcon())
 
     def read_modbus_data(self):
         """Reads data from Modbus device based on selected function code."""
@@ -2023,8 +2475,13 @@ class ModbusClientApp(QMainWindow):
             self.sum_response_times += duration
             self.average_response_time = self.sum_response_times / self.total_polls
 
+            self.last_read_params = {
+                "slave": slave_id, "function": selected_function_text,
+                "data_type": self.data_type_cb.currentText(), "byte_order": self.swap_bytes_cb.currentText(),
+            }
             self.display_registers(start_address, data_to_display, selected_function_text)
             self.style_result_rows()
+            self.feed_chart()
             
             # Nowy, bardziej precyzyjny komunikat w zależności od ilości odebranych elementów
             if len(data_to_display) > 0:
@@ -2394,11 +2851,105 @@ class ModbusClientApp(QMainWindow):
         s.setValue("log_visible", self.show_log_btn.isChecked())
         s.sync()
 
+    # --- Wykres ---
+
+    def show_chart_window(self):
+        if self.chart_window is None:
+            self.chart_window = ChartWindow(self)
+        self.chart_window.show()
+        self.chart_window.raise_()
+        self.chart_window.activateWindow()
+
+    def row_series_key(self, row):
+        """Identyfikator serii: Slave ID, funkcja, adres, typ danych i kolejność bajtów ostatniego odczytu."""
+        p = self.last_read_params
+        item = self.registers_table.item(row, 0)
+        if not p or item is None:
+            return None
+        try:
+            address = int(item.text())
+        except ValueError:
+            return None
+        is_bits = "Coils" in p["function"] or "Discrete Inputs" in p["function"]
+        data_type = "BOOL" if is_bits else p["data_type"].split()[0]
+        order = p["byte_order"].split()[0] if data_type not in ("BOOL", "UINT16", "INT16") else ""
+        return (p["slave"], p["function"][:4], address, data_type, order)
+
+    @staticmethod
+    def series_label(key):
+        slave, function, address, data_type, order = key
+        table = {"0x01": "CO", "0x02": "DI", "0x03": "HR", "0x04": "IR"}.get(function, function)
+        return f"ID{slave} {table} {address} {data_type}" + (f" {order}" if order else "")
+
+    def row_value(self, row):
+        item = self.registers_table.item(row, 3)
+        if item is None:
+            return None
+        text = item.text()
+        if text in ("True", "False"):
+            return 1.0 if text == "True" else 0.0
+        try:
+            return float(text)
+        except ValueError:
+            return None # np. niepełna wartość 32/64-bit
+
+    def selected_result_rows(self):
+        return sorted({index.row() for index in self.registers_table.selectionModel().selectedRows()})
+
+    def table_context_menu(self, pos):
+        row = self.registers_table.rowAt(pos.y())
+        if row >= 0 and row not in self.selected_result_rows():
+            self.registers_table.selectRow(row)
+        rows = self.selected_result_rows()
+        keys = [k for k in (self.row_series_key(r) for r in rows) if k]
+        on_chart = [k for k in keys if self.chart_window and self.chart_window.has_series(k)]
+        menu = QMenu(self)
+        add = menu.addAction(icon(G_CHART), f"Add to chart ({len(keys)})" if len(keys) > 1 else "Add to chart",
+                             lambda: self.add_rows_to_chart(rows))
+        add.setEnabled(len(on_chart) < len(keys))
+        remove = menu.addAction("Remove from chart", lambda: self.chart_window.remove_keys(on_chart))
+        remove.setEnabled(bool(on_chart))
+        menu.addSeparator()
+        menu.addAction("Open chart", self.show_chart_window)
+        menu.exec(self.registers_table.viewport().mapToGlobal(pos))
+
+    def add_rows_to_chart(self, rows):
+        if self.chart_window is None:
+            self.chart_window = ChartWindow(self)
+        t = time.time()
+        values = {}
+        for row in rows:
+            key = self.row_series_key(row)
+            value = self.row_value(row)
+            if key is None or value is None:
+                continue
+            self.chart_window.add_series(key, self.series_label(key))
+            values[key] = value
+        self.chart_window.add_samples(t, values) # bieżąca wartość jako pierwsza próbka
+        self.style_result_rows()
+        self.show_chart_window()
+
+    def feed_chart(self):
+        """Po każdym udanym odczycie dopisuje próbki serii obecnych w tabeli wyników."""
+        if not (self.chart_window and self.chart_window.series):
+            return
+        t = time.time()
+        values = {}
+        for row in range(self.registers_table.rowCount()):
+            key = self.row_series_key(row)
+            if key and self.chart_window.has_series(key):
+                value = self.row_value(row)
+                if value is not None:
+                    values[key] = value
+        self.chart_window.add_samples(t, values)
+
     def closeEvent(self, event):
         self.polling_timer.stop()
         self.save_settings()
         if self.scanner_window:
             self.scanner_window.close()
+        if self.chart_window:
+            self.chart_window.close()
         if self.modbus_client:
             self.modbus_client.close()
         super().closeEvent(event)
