@@ -21,6 +21,8 @@ pymms bez fizycznego urządzenia.
 - **Cykliczny odczyt** z ustawianym interwałem.
 - **Okno logów transmisji** – każda wysłana i odebrana ramka w HEX z dekodowaniem, a także timeouty, błędy CRC,
   niepełne i spóźnione odpowiedzi.
+- **Skaner** – wyszukiwanie urządzeń w zakresie Slave ID albo rejestrów w zakresie adresów, z eksportem wyników
+  do pliku CSV gotowego do wczytania w pymss.
 - Statystyki na pasku statusu: liczba odpytań, liczba błędów, czas ostatniej odpowiedzi i średni czas odpowiedzi.
 - Własna implementacja Modbus master (TCP i RTU) – nie wymaga biblioteki pymodbus.
 
@@ -119,6 +121,36 @@ Na czerwono (**ERROR**) zapisywane są problemy z komunikacją:
 
 Opcje okna: filtry **RX / TX / Info / Errors**, **Decode frames**, **Pause**, **Auto-scroll**, limit linii
 (**Max lines**), **Clear** i zapis do pliku (**Save...**).
+
+### 7. Skaner
+
+Przycisk **Scanner** otwiera okno skanera. Skaner korzysta z bieżącego połączenia z okna głównego, więc najpierw
+kliknij **Connect**. Na czas skanowania zatrzymywany jest odczyt cykliczny.
+
+**Slave ID scan** – wyszukuje urządzenia na magistrali. Dla każdego Slave ID z zakresu **from–to** wysyła
+zapytanie wybraną funkcją o rejestry **Address** / **Quantity**. Urządzenie uznawane jest za obecne, gdy odpowie
+danymi albo wyjątkiem (np. 02 – urządzenie jest, ale nie ma takiego adresu).
+
+![Skaner Slave ID](docs/pymms_scanner_id.png)
+
+**Address scan** – wyszukuje rejestry w jednym urządzeniu. Odpytuje adresy z zakresu **from–to** wybranym
+Slave ID i funkcją. **Quantity per request** = 1 sprawdza każdy adres osobno i daje dokładną mapę rejestrów.
+Większa wartość przyspiesza skanowanie, ale jeden niezdefiniowany adres w bloku powoduje odrzucenie całego bloku.
+
+![Skaner adresów](docs/pymms_scanner_addr.png)
+
+| Opcja | Opis |
+|---|---|
+| **Timeout (ms)** | Czas oczekiwania na odpowiedź używany tylko przez skaner. Krótszy timeout przyspiesza skanowanie zakresu, w którym większość ID nie odpowiada. |
+| **Delay between requests (ms)** | Przerwa między zapytaniami. Przydatna przy wolnych urządzeniach RTU. |
+| **Show only responding** | Pokazuje tylko znalezione urządzenia lub rejestry. Po odznaczeniu widać także timeouty i wyjątki. |
+| **Log frames in Transmission Log** | Zapisuje ramki skanera w oknie logów. Wyłącz przy dużych zakresach, żeby nie zalać logu. |
+
+Wiersze są kolorowane według wyniku: zielony – odpowiedź z danymi, pomarańczowy – wyjątek, czerwony – błąd.
+**Stop** przerywa skanowanie od razu. Przy utracie połączenia skaner zatrzymuje się sam.
+
+**Export CSV...** zapisuje udane odczyty jako mapę rejestrów w formacie pymss (UINT16 dla rejestrów, BOOL dla
+bitów). Taki plik można od razu wczytać w pymss przez **Import CSV...** i zasymulować zeskanowane urządzenie.
 
 ## Kolejność bajtów
 

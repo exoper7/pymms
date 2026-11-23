@@ -1,5 +1,6 @@
 import sys
 import os
+import csv
 import socket
 import struct
 import serial
@@ -10,7 +11,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLineEdit, QPushButton, QComboBox, QLabel, QCheckBox,
     QTableWidget, QTableWidgetItem, QDialog, QDialogButtonBox,
-    QMessageBox, QSpinBox, QPlainTextEdit, QFileDialog
+    QMessageBox, QSpinBox, QPlainTextEdit, QFileDialog, QProgressBar, QAbstractItemView
 )
 from PyQt6.QtCore import Qt, QTimer, QObject # Dodano QObject dla disconnect
 from PyQt6.QtGui import QIcon, QColor, QFont, QTextCursor, QTextCharFormat
@@ -819,6 +820,369 @@ def convert_bytes_to_modbus_registers_for_writing(data_bytes): # Usunięto swap_
     return registers
 
 
+class ScannerWindow(QWidget):
+    """Skaner Modbus: wyszukiwanie urządzeń (zakres Slave ID) lub rejestrów (zakres adresów w jednym ID).
+    Zapytania wysyłane są krok po kroku z QTimer, więc GUI pozostaje responsywne, a Stop działa od razu."""
+    FUNCTIONS = [ # (etykieta, kod funkcji, metoda klienta, nazwa tabeli w pymss)
+        ("0x03 (Holding Registers)", 0x03, "read_holding_registers", "holding_register"),
+        ("0x04 (Input Registers)", 0x04, "read_input_registers", "input_register"),
+        ("0x01 (Coils)", 0x01, "read_coils", "coil"),
+        ("0x02 (Discrete Inputs)", 0x02, "read_discrete_inputs", "discrete_input"),
+    ]
+    COLUMNS = ["Slave ID", "Address", "Address (HEX)", "Status", "Time (ms)", "Value (HEX)", "Value"]
+    STATUS_COLORS = {"ok": QColor(214, 240, 170), "exception": QColor(255, 226, 170), "error": QColor(255, 200, 200)}
+
+    def __init__(self, app_window):
+        super().__init__(app_window, Qt.WindowType.Window)
+        self.app_window = app_window # główne okno pymms (połączenie, log)
+        self.setWindowTitle("pymms - Scanner")
+        self.resize(950, 600)
+        self.jobs = []
+        self.job_index = 0
+        self.results = []
+        self.scan_mode = None
+        self.scan_function = None
+        self.step_timer = QTimer(self)
+        self.step_timer.setSingleShot(True)
+        self.step_timer.timeout.connect(self.run_next_job)
+
+        layout = QVBoxLayout(self)
+
+        # --- Parametry skanowania ---
+        params_group = QGroupBox("Scan Settings")
+        params_layout = QVBoxLayout(params_group)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("Mode:"))
+        self.mode_cb = QComboBox()
+        self.mode_cb.addItem("Slave ID scan (find devices)", "id")
+        self.mode_cb.addItem("Address scan (find registers in one ID)", "address")
+        self.mode_cb.currentIndexChanged.connect(self.on_mode_changed)
+        row1.addWidget(self.mode_cb)
+        row1.addWidget(QLabel("Function:"))
+        self.function_cb = QComboBox()
+        for label, _, _, _ in self.FUNCTIONS:
+            self.function_cb.addItem(label)
+        self.function_cb.currentIndexChanged.connect(self.on_function_changed)
+        row1.addWidget(self.function_cb)
+        row1.addStretch()
+        params_layout.addLayout(row1)
+
+        # Tryb ID: zakres Slave ID + stałe rejestry
+        self.id_params = QWidget()
+        id_layout = QHBoxLayout(self.id_params)
+        id_layout.setContentsMargins(0, 0, 0, 0)
+        id_layout.addWidget(QLabel("Slave ID from:"))
+        self.id_from_sb = self._spin(1, 247, 1)
+        id_layout.addWidget(self.id_from_sb)
+        id_layout.addWidget(QLabel("to:"))
+        self.id_to_sb = self._spin(1, 247, 247)
+        id_layout.addWidget(self.id_to_sb)
+        id_layout.addSpacing(15)
+        id_layout.addWidget(QLabel("Address:"))
+        self.id_address_sb = self._spin(0, 65535, 0)
+        id_layout.addWidget(self.id_address_sb)
+        id_layout.addWidget(QLabel("Quantity:"))
+        self.id_count_sb = self._spin(1, 125, 1)
+        id_layout.addWidget(self.id_count_sb)
+        id_layout.addStretch()
+        params_layout.addWidget(self.id_params)
+
+        # Tryb adresów: jedno ID + zakres adresów
+        self.address_params = QWidget()
+        addr_layout = QHBoxLayout(self.address_params)
+        addr_layout.setContentsMargins(0, 0, 0, 0)
+        addr_layout.addWidget(QLabel("Slave ID:"))
+        self.addr_slave_sb = self._spin(1, 247, 1)
+        addr_layout.addWidget(self.addr_slave_sb)
+        addr_layout.addSpacing(15)
+        addr_layout.addWidget(QLabel("Address from:"))
+        self.addr_from_sb = self._spin(0, 65535, 0)
+        addr_layout.addWidget(self.addr_from_sb)
+        addr_layout.addWidget(QLabel("to:"))
+        self.addr_to_sb = self._spin(0, 65535, 99)
+        addr_layout.addWidget(self.addr_to_sb)
+        addr_layout.addWidget(QLabel("Quantity per request:"))
+        self.addr_count_sb = self._spin(1, 125, 1)
+        self.addr_count_sb.setToolTip("1 - every address is checked separately (finds exact register map).\n"
+                                      "More - faster, but one undefined address fails the whole block.")
+        addr_layout.addWidget(self.addr_count_sb)
+        addr_layout.addStretch()
+        params_layout.addWidget(self.address_params)
+        self.address_params.hide()
+
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Timeout (ms):"))
+        self.timeout_sb = self._spin(20, 30000, 300)
+        self.timeout_sb.setToolTip("Response timeout used only by the scanner")
+        row3.addWidget(self.timeout_sb)
+        row3.addWidget(QLabel("Delay between requests (ms):"))
+        self.delay_sb = self._spin(0, 10000, 20)
+        row3.addWidget(self.delay_sb)
+        self.only_found_cb = QCheckBox("Show only responding")
+        self.only_found_cb.setChecked(True)
+        self.only_found_cb.toggled.connect(self.rebuild_table)
+        row3.addWidget(self.only_found_cb)
+        self.log_frames_cb = QCheckBox("Log frames in Transmission Log")
+        self.log_frames_cb.setChecked(True)
+        row3.addWidget(self.log_frames_cb)
+        row3.addStretch()
+        params_layout.addLayout(row3)
+        layout.addWidget(params_group)
+
+        # --- Sterowanie ---
+        controls = QHBoxLayout()
+        self.start_btn = QPushButton("Start Scan")
+        self.start_btn.clicked.connect(self.start_scan)
+        controls.addWidget(self.start_btn)
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.clicked.connect(lambda: self.finish_scan("Scan stopped by user."))
+        self.stop_btn.setEnabled(False)
+        controls.addWidget(self.stop_btn)
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(True)
+        controls.addWidget(self.progress, 1)
+        self.export_btn = QPushButton("Export CSV...")
+        self.export_btn.setToolTip("Saves successful readings as a pymss register map (can be imported into pymss)")
+        self.export_btn.clicked.connect(self.export_csv)
+        controls.addWidget(self.export_btn)
+        self.clear_btn = QPushButton("Clear")
+        self.clear_btn.clicked.connect(self.clear_results)
+        controls.addWidget(self.clear_btn)
+        layout.addLayout(controls)
+
+        # --- Wyniki ---
+        self.table = QTableWidget()
+        self.table.setColumnCount(len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.verticalHeader().setVisible(False)
+        for col, width in enumerate([70, 90, 100, 300, 75, 150]):
+            self.table.setColumnWidth(col, width)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self.table)
+
+        self.summary_label = QLabel("Ready")
+        self.summary_label.setStyleSheet(f"background-color: {ACCENT}; color: #1A1A1A; padding: 3px 6px;")
+        layout.addWidget(self.summary_label)
+
+    @staticmethod
+    def _spin(minimum, maximum, value):
+        sb = QSpinBox()
+        sb.setRange(minimum, maximum)
+        sb.setValue(value)
+        return sb
+
+    def on_mode_changed(self):
+        is_id = self.mode_cb.currentData() == "id"
+        self.id_params.setVisible(is_id)
+        self.address_params.setVisible(not is_id)
+
+    def on_function_changed(self):
+        max_count = 2000 if self.FUNCTIONS[self.function_cb.currentIndex()][1] in (0x01, 0x02) else 125
+        self.id_count_sb.setMaximum(max_count)
+        self.addr_count_sb.setMaximum(max_count)
+
+    def set_running(self, running):
+        self.start_btn.setEnabled(not running)
+        self.stop_btn.setEnabled(running)
+        for w in (self.mode_cb, self.function_cb, self.id_params, self.address_params, self.timeout_sb):
+            w.setEnabled(not running)
+
+    # --- Przebieg skanowania ---
+
+    def start_scan(self):
+        client = self.app_window.modbus_client
+        if not (client and client.connected):
+            QMessageBox.warning(self, "Scanner", "Connect to a Modbus device or network first (main window).")
+            return
+        self.app_window.stop_cyclic_read() # skaner i odczyt cykliczny nie powinny przeplatać zapytań
+        self.scan_mode = self.mode_cb.currentData()
+        self.scan_function = self.FUNCTIONS[self.function_cb.currentIndex()]
+        if self.scan_mode == "id":
+            first, last = sorted((self.id_from_sb.value(), self.id_to_sb.value()))
+            address, count = self.id_address_sb.value(), self.id_count_sb.value()
+            if address + count > 65536:
+                QMessageBox.warning(self, "Scanner", "Address + quantity exceeds 65535.")
+                return
+            self.jobs = [(slave, address, count) for slave in range(first, last + 1)]
+        else:
+            first, last = sorted((self.addr_from_sb.value(), self.addr_to_sb.value()))
+            step = self.addr_count_sb.value()
+            slave = self.addr_slave_sb.value()
+            self.jobs = [(slave, a, min(step, last - a + 1)) for a in range(first, last + 1, step)]
+        self.results = []
+        self.job_index = 0
+        self.table.setRowCount(0)
+        self.progress.setRange(0, len(self.jobs))
+        self.progress.setValue(0)
+        self.set_running(True)
+        self.summary_label.setText(f"Scanning... 0 / {len(self.jobs)}")
+        self.app_window.log("INFO", "Scanner", b"", f"{self.mode_cb.currentText()} started: {len(self.jobs)} request(s), "
+                            f"{self.scan_function[0]}, timeout {self.timeout_sb.value()} ms")
+        self.step_timer.start(0)
+
+    def run_next_job(self):
+        client = self.app_window.modbus_client
+        if not (client and client.connected):
+            self.finish_scan("Scan aborted: connection lost.")
+            return
+        slave, address, count = self.jobs[self.job_index]
+        result = self.execute(client, slave, address, count)
+        self.results.append(result)
+        self.add_result_rows(result)
+        self.job_index += 1
+        self.progress.setValue(self.job_index)
+        self.summary_label.setText(f"Scanning... {self.job_index} / {len(self.jobs)} | {self.summary_text()}")
+        if result["kind"] == "lost":
+            self.app_window.update_connection_buttons()
+            self.finish_scan("Scan aborted: connection lost.")
+        elif self.job_index >= len(self.jobs):
+            self.finish_scan("Scan finished.")
+        else:
+            self.step_timer.start(self.delay_sb.value())
+
+    def execute(self, client, slave, address, count):
+        """Jedno zapytanie skanera - z timeoutem skanera i opcjonalnie bez logowania ramek."""
+        saved_timeout, saved_log = client.timeout, client.log
+        client.timeout = self.timeout_sb.value() / 1000.0
+        if not self.log_frames_cb.isChecked():
+            client.log = lambda *args, **kwargs: None
+        result = {"slave": slave, "address": address, "count": count, "values": [], "time": None}
+        start = time.perf_counter()
+        try:
+            response = getattr(client, self.scan_function[2])(address=address, count=count, slave=slave)
+            result["time"] = (time.perf_counter() - start) * 1000.0
+            if response.isError():
+                result["kind"] = "exception"
+                result["status"] = (f"Exception {response.exception_code:02X} "
+                                    f"({EXCEPTION_NAMES.get(response.exception_code, 'Unknown')})")
+            else:
+                result["kind"] = "ok"
+                result["status"] = "OK"
+                result["values"] = response.bits if self.scan_function[1] in (0x01, 0x02) else response.registers
+        except ModbusException as e:
+            text = str(e)
+            result["kind"] = "lost" if "CLOSING CONNECTION" in text else ("timeout" if "No response" in text else "error")
+            result["status"] = "No response (timeout)" if result["kind"] == "timeout" else text
+        finally:
+            client.timeout = saved_timeout
+            if client.log is not saved_log:
+                client.log = saved_log
+        return result
+
+    def is_found(self, result):
+        # W trybie ID urządzenie istnieje także wtedy, gdy odpowiedziało wyjątkiem (np. 02 dla tego adresu)
+        if self.scan_mode == "id":
+            return result["kind"] in ("ok", "exception")
+        return result["kind"] == "ok"
+
+    def summary_text(self):
+        found = [r for r in self.results if self.is_found(r)]
+        if self.scan_mode == "id":
+            ids = ", ".join(str(r["slave"]) for r in found)
+            return f"Responding Slave IDs: {len(found)}" + (f" ({ids})" if ids else "")
+        registers = sum(r["count"] for r in found)
+        return f"Responding addresses: {registers} of {sum(r['count'] for r in self.results)}"
+
+    def finish_scan(self, message):
+        self.step_timer.stop()
+        self.set_running(False)
+        self.summary_label.setText(f"{message} {self.job_index} / {len(self.jobs)} request(s) | {self.summary_text()}")
+        self.app_window.log("INFO", "Scanner", b"", f"{message} {self.summary_text()}")
+
+    # --- Tabela wyników ---
+
+    def add_result_rows(self, result):
+        if self.only_found_cb.isChecked() and not self.is_found(result):
+            return
+        is_bits = self.scan_function[1] in (0x01, 0x02)
+        if result["kind"] == "ok" and (self.scan_mode == "address" or result["count"] == 1):
+            # wiersz na każdy adres (w trybie ID przy pojedynczym rejestrze to też jeden wiersz)
+            for i, value in enumerate(result["values"]):
+                self.append_row(result, result["address"] + i, value, is_bits)
+        else:
+            self.append_row(result, result["address"], None, is_bits, block_values=result["values"])
+
+    def append_row(self, result, address, value, is_bits, block_values=None):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        last = result["address"] + result["count"] - 1
+        span = result["count"] > 1 and value is None
+        if value is not None:
+            hex_text = str(int(value)) if is_bits else f"0x{value:04X}"
+            dec_text = str(bool(value)) if is_bits else str(value)
+        elif block_values:
+            hex_text = " ".join(str(int(v)) if is_bits else f"0x{v:04X}" for v in block_values)
+            dec_text = " ".join(str(int(v)) if is_bits else str(v) for v in block_values)
+        else:
+            hex_text = dec_text = ""
+        items = [
+            str(result["slave"]),
+            f"{address}-{last}" if span else str(address),
+            f"0x{address:04X}-0x{last:04X}" if span else f"0x{address:04X}",
+            result["status"],
+            f"{result['time']:.1f}" if result["time"] is not None else "",
+            hex_text,
+            dec_text,
+        ]
+        color = self.STATUS_COLORS.get(result["kind"] if result["kind"] != "lost" else "error")
+        for col, text in enumerate(items):
+            item = QTableWidgetItem(text)
+            if color is not None:
+                item.setData(Qt.ItemDataRole.BackgroundRole, color)
+            self.table.setItem(row, col, item)
+
+    def rebuild_table(self):
+        self.table.setRowCount(0)
+        if self.scan_function is None:
+            return
+        for result in self.results:
+            self.add_result_rows(result)
+
+    def clear_results(self):
+        if self.step_timer.isActive():
+            return
+        self.results = []
+        self.table.setRowCount(0)
+        self.progress.setValue(0)
+        self.summary_label.setText("Ready")
+
+    def export_csv(self):
+        """Zapisuje udane odczyty jako mapę rejestrów pymss (do bezpośredniego importu w symulatorze)."""
+        rows = []
+        if self.scan_function:
+            is_bits = self.scan_function[1] in (0x01, 0x02)
+            for r in self.results:
+                if r["kind"] != "ok":
+                    continue
+                for i, value in enumerate(r["values"]):
+                    rows.append([r["slave"], self.scan_function[3], r["address"] + i, "BOOL" if is_bits else "UINT16",
+                                 "ABCD", str(bool(value)) if is_bits else value, f"scanned {datetime.now():%Y-%m-%d %H:%M}"])
+        if not rows:
+            QMessageBox.information(self, "Export CSV", "No successful readings to export.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export Scan Results", f"scan_{datetime.now():%Y%m%d_%H%M%S}.csv",
+                                              "CSV files (*.csv);;All files (*)")
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f, delimiter=";")
+                writer.writerow(["slave_id", "table", "address", "data_type", "byte_order", "value", "description"])
+                writer.writerows(rows)
+        except OSError as e:
+            QMessageBox.critical(self, "Export CSV", f"Cannot write file: {e}")
+            return
+        self.summary_label.setText(f"Exported {len(rows)} reading(s) to {os.path.basename(path)}")
+
+    def closeEvent(self, event):
+        if self.step_timer.isActive():
+            self.finish_scan("Scan stopped (window closed).")
+        super().closeEvent(event)
+
+
 class ModbusValueEditor(QDialog):
     """Dialog to edit register value."""
     def __init__(self, current_value, register_address, data_type, parent=None):
@@ -883,7 +1247,7 @@ class ModbusValueEditor(QDialog):
 
 class ModbusClientApp(QMainWindow):
     # Wersja aplikacji, która będzie inkrementowana
-    __version__ = "1.12"
+    __version__ = "1.13"
 
     def __init__(self):
         super().__init__()
@@ -903,6 +1267,7 @@ class ModbusClientApp(QMainWindow):
         self.modbus_client = None
         self.connection_type = "RTU" # Default connection type
         self.log_window = LogWindow(self) # Okno logów transmisji
+        self.scanner_window = None # Okno skanera (tworzone przy pierwszym otwarciu)
 
         # Initialize button attributes before calling init_ui
         self.connect_btn = None
@@ -1048,6 +1413,11 @@ class ModbusClientApp(QMainWindow):
         self.read_data_btn.setEnabled(False) # Set initial state
         read_params_layout.addWidget(self.read_data_btn)
         read_params_layout.addStretch() # Stretch to push buttons to the right
+
+        self.show_scanner_btn = QPushButton("Scanner")
+        self.show_scanner_btn.setToolTip("Scan Slave IDs or register addresses")
+        self.show_scanner_btn.clicked.connect(self.show_scanner_window)
+        read_params_layout.addWidget(self.show_scanner_btn)
 
         self.show_log_btn = QPushButton("Transmission Log")
         self.show_log_btn.clicked.connect(self.show_log_window)
@@ -1719,8 +2089,17 @@ class ModbusClientApp(QMainWindow):
         self.log_window.raise_()
         self.log_window.activateWindow()
 
+    def show_scanner_window(self):
+        if self.scanner_window is None:
+            self.scanner_window = ScannerWindow(self)
+        self.scanner_window.show()
+        self.scanner_window.raise_()
+        self.scanner_window.activateWindow()
+
     def closeEvent(self, event):
         self.polling_timer.stop()
+        if self.scanner_window:
+            self.scanner_window.close()
         if self.modbus_client:
             self.modbus_client.close()
         self.log_window.close()
