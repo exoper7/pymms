@@ -56,8 +56,10 @@ Okno składa się z czterech części:
 - **obszar główny** – tabela wyników, a pod nią log transmisji.
 
 Ustawienia i układ okna są zapamiętywane między uruchomieniami w pliku **`pymms.ini` obok programu**
-(obok `pymms.pyw` albo `pymms.exe`). Plik jest tekstowy i można go skopiować razem z programem albo usunąć,
-żeby wrócić do ustawień domyślnych. Jeśli katalog programu jest tylko do odczytu (np. `Program Files`),
+(obok `pymms.pyw` albo `pymms.exe`). Plik jest tekstowy i można go skopiować razem z programem.
+Przycisk **Restore defaults** na dole panelu bocznego przywraca ustawienia domyślne: połączenie, zapytanie,
+interpretację danych i układ okna. Zamyka przy tym aktywne połączenie i czyści `pymms.ini`, po wcześniejszym
+potwierdzeniu. Jeśli katalog programu jest tylko do odczytu (np. `Program Files`),
 plik trafia do katalogu konfiguracji użytkownika: `%LOCALAPPDATA%\pymms` w Windows albo `~/.config/pymms`
 w Linuksie.
 
@@ -148,7 +150,9 @@ Opcje panelu:
 
 ### 7. Skaner
 
-Przycisk **Scanner** otwiera okno skanera. Skaner korzysta z bieżącego połączenia z okna głównego, więc najpierw
+Przycisk **Scanner** otwiera okno skanera. Okna skanera i wykresu są niezależne: nie są trzymane nad oknem
+głównym, mają własną pozycję na pasku zadań i można je przenieść np. na drugi monitor. Zamykają się razem
+z programem. Skaner korzysta z bieżącego połączenia z okna głównego, więc najpierw
 kliknij **Connect**. Na czas skanowania zatrzymywany jest odczyt cykliczny.
 
 **Slave ID scan** – wyszukuje urządzenia na magistrali. Dla każdego Slave ID z zakresu **from–to** wysyła

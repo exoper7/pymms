@@ -268,7 +268,7 @@ def icon(glyph, color=C_TEXT, size=16):
 
 G_REFRESH, G_PLAY, G_STOP, G_DELETE, G_SAVE = "", "", "", "", ""
 G_SEARCH, G_DOWN, G_PLUG, G_SYNC, G_LIST, G_PAUSE = "", "", "", "", "", ""
-G_CHART = "\ue9d2"
+G_CHART, G_RESTORE = "\ue9d2", "\ue777"
 
 
 def mono_family():
@@ -1059,9 +1059,10 @@ class ScannerWindow(QWidget):
     STATUS_COLORS = {"ok": QColor(143, 206, 0, 34), "exception": QColor(242, 180, 60, 40), "error": QColor(255, 95, 95, 40)}
 
     def __init__(self, app_window):
-        super().__init__(app_window, Qt.WindowType.Window)
+        super().__init__() # okno niezależne (bez rodzica) - nie jest trzymane nad oknem głównym
         self.app_window = app_window # główne okno pymms (połączenie, log)
         self.setWindowTitle("pymms - Scanner")
+        self.setWindowIcon(app_window.windowIcon())
         self.resize(950, 600)
         self.jobs = []
         self.job_index = 0
@@ -1660,7 +1661,7 @@ class ChartWindow(QWidget):
     ROLE_KEY = Qt.ItemDataRole.UserRole
 
     def __init__(self, app_window):
-        super().__init__(app_window, Qt.WindowType.Window)
+        super().__init__() # okno niezależne (bez rodzica) - nie jest trzymane nad oknem głównym
         self.app_window = app_window
         self.setWindowTitle("pymms - Chart")
         self.setWindowIcon(app_window.windowIcon())
@@ -1911,7 +1912,7 @@ class ModbusValueEditor(QDialog):
 
 class ModbusClientApp(QMainWindow):
     # Wersja aplikacji, która będzie inkrementowana
-    __version__ = "1.17"
+    __version__ = "1.18"
 
     FUNCTIONS = ["0x03 (Holding Registers)", "0x04 (Input Registers)", "0x01 (Coils)", "0x02 (Discrete Inputs)"]
     DATA_TYPES = ["UINT16 (16-bit Unsigned)", "INT16 (16-bit Signed)",
@@ -2146,6 +2147,11 @@ class ModbusClientApp(QMainWindow):
         hint = QLabel("Double-click a value in the table to write it to the device.", objectName="hint")
         hint.setWordWrap(True)
         sl.addWidget(hint)
+        sl.addSpacing(6)
+        self.defaults_btn = QPushButton("Restore defaults", icon=icon(G_RESTORE),
+                                        toolTip="Reset connection, request, interpretation and window layout to defaults")
+        self.defaults_btn.clicked.connect(self.restore_defaults)
+        sl.addWidget(self.defaults_btn)
         self.hsplit.addWidget(side)
 
         self.vsplit = QSplitter(Qt.Orientation.Vertical, childrenCollapsible=False)
@@ -2809,18 +2815,60 @@ class ModbusClientApp(QMainWindow):
         "quantity": "num_registers_sb", "interval": "polling_interval_ms_sb",
     }
 
+    def apply_defaults(self):
+        """Wartości domyślne wszystkich zapamiętywanych ustawień (start bez pymms.ini i przycisk Restore defaults)."""
+        self.set_connection_type("RTU")
+        if self.com_port_cb.count():
+            self.com_port_cb.setCurrentIndex(0)
+        self.baud_rate_cb.setCurrentText("9600")
+        self.data_bits_cb.setCurrentText("8")
+        self.parity_cb.setCurrentText("N")
+        self.stop_bits_cb.setCurrentText("1")
+        self.ip_address_le.setText("192.168.1.1")
+        self.port_le.setText("502")
+        self.timeout_ms_sb.setValue(500)
+        self.slave_id_sb.setValue(1)
+        self.modbus_function_cb.setCurrentIndex(0)
+        self.data_type_cb.setCurrentIndex(0)
+        self.swap_bytes_cb.setCurrentIndex(0)
+        self.on_modbus_function_changed()
+        self.start_address_sb.setValue(0)
+        self.num_registers_sb.setValue(10)
+        self.polling_interval_ms_sb.setValue(1000)
+        self.show_log_btn.setChecked(True)
+        self.resize(1280, 780)
+        self.hsplit.setSizes([240, 1000])
+        self.vsplit.setSizes([420, 260])
+
+    def restore_defaults(self):
+        answer = QMessageBox.question(
+            self, "Restore defaults",
+            "Restore default settings?\n\nConnection, request, data interpretation and window layout will be reset "
+            "and pymms.ini will be cleared." + ("\nThe current connection will be closed." if self.modbus_client else ""))
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if self.modbus_client:
+            self.disconnect_modbus()
+        self.settings.clear()
+        self.apply_defaults()
+        self.save_settings()
+        self.status_message_label.setText("Default settings restored.")
+        self.status_message_label.setStyleSheet("")
+
     def restore_settings(self):
         s = self.settings
+        self.apply_defaults()
         geometry = s.value("geometry")
         if geometry is not None:
             self.restoreGeometry(geometry)
-        else:
-            self.resize(1280, 780)
         for key, splitter in (("hsplit", self.hsplit), ("vsplit", self.vsplit)):
             state = s.value(key)
             if state is not None:
                 splitter.restoreState(state)
         self.set_connection_type(s.value("connection_type", "RTU"))
+        port_index = self.com_port_cb.findData(s.value("port"))
+        if port_index >= 0:
+            self.com_port_cb.setCurrentIndex(port_index)
         for key, name in self.SETTINGS_WIDGETS.items():
             value = s.value(key)
             if value is not None:
