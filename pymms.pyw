@@ -2,19 +2,22 @@ import sys
 import os
 import csv
 import socket
+import tempfile
 import struct
 import serial
 import serial.tools.list_ports # Do wykrywania portów COM
 import time # Import time for performance measurement
 from datetime import datetime
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QGroupBox, QLineEdit, QPushButton, QComboBox, QLabel, QCheckBox,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFrame, QSplitter,
+    QGroupBox, QLineEdit, QPushButton, QToolButton, QButtonGroup, QComboBox, QLabel, QCheckBox,
     QTableWidget, QTableWidgetItem, QDialog, QDialogButtonBox,
     QMessageBox, QSpinBox, QPlainTextEdit, QFileDialog, QProgressBar, QAbstractItemView
 )
-from PyQt6.QtCore import Qt, QTimer, QObject # Dodano QObject dla disconnect
-from PyQt6.QtGui import QIcon, QColor, QFont, QTextCursor, QTextCharFormat
+from PyQt6.QtCore import Qt, QTimer, QRect, QSettings, QStandardPaths, QPointF
+from PyQt6.QtGui import (
+    QIcon, QColor, QFont, QFontDatabase, QPainter, QPalette, QPen, QPixmap, QPolygonF, QTextCursor, QTextCharFormat
+)
 
 from struct import pack, unpack
 
@@ -25,50 +28,260 @@ def resource_path(name):
     return os.path.join(base, name)
 
 
-# --- Akcent kolorystyczny (odróżnia pymms od pymss przy pracy obok siebie) ---
+# --- Ustawienia aplikacji (plik pymms.ini obok programu) ---
 
-ACCENT = "#8FCE00"        # zielony - nagłówek tabeli, pasek statusu, ramki, zaznaczenie
-ACCENT_TEXT = "#4F7300"   # ciemniejsza zieleń - tytuły sekcji (czytelna na jasnym tle)
-ACCENT_BORDER = "#7DB300" # linie między kolumnami nagłówka
-STATUS_RED = "#B00020"    # kolory komunikatów czytelne na zielonym pasku statusu
-STATUS_ORANGE = "#8A4B00"
+SETTINGS_FILE = "pymms.ini"
+
+def app_dir():
+    """Katalog aplikacji: folder skryptu, a w exe (PyInstaller) folder pliku exe - nie tymczasowy _MEIPASS."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+def settings_path():
+    """pymms.ini obok programu; gdy katalog jest tylko do odczytu (np. Program Files) - katalog konfiguracji użytkownika."""
+    path = os.path.join(app_dir(), SETTINGS_FILE)
+    try:
+        with open(path, "a", encoding="utf-8"):
+            pass
+        return path
+    except OSError:
+        base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.GenericConfigLocation) or os.path.expanduser("~")
+        folder = os.path.normpath(os.path.join(base, "pymms"))
+        os.makedirs(folder, exist_ok=True)
+        return os.path.join(folder, SETTINGS_FILE)
+
+def open_settings():
+    return QSettings(settings_path(), QSettings.Format.IniFormat)
+
+
+# --- Motyw (ciemny, w stylu Serial Log Viewer; zielony kolor wiodący odróżnia pymms od pymss) ---
+
+C_BG = "#14161b"
+C_PANEL = "#1b1e24"
+C_PANEL2 = "#21252c"
+C_BORDER = "#2b3039"
+C_TEXT = "#d8dbe2"
+C_MUTED = "#8b919d"
+C_DIM = "#5b616d"
+ACCENT = "#8FCE00"        # zielony kolor wiodący
+ACCENT_HOVER = "#a3dd2a"
+ACCENT_INK = "#11160a"    # tekst na zielonym tle
+C_SEL = "#2c3a17"         # zaznaczenie (ciemna zieleń)
+STATUS_RED = "#ff5f5f"    # kolory komunikatów
+STATUS_ORANGE = "#f2b43c"
+C_BLUE = "#58a6ff"
+C_GREEN = "#4cc38a"
 
 ACCENT_STYLESHEET = f"""
-QGroupBox {{
-    border: 1px solid {ACCENT};
-    border-radius: 4px;
-    margin-top: 10px;
-    padding-top: 6px;
+* {{ font-family: "Segoe UI"; font-size: 9pt; color: {C_TEXT}; }}
+QMainWindow, QWidget#central, QDialog {{ background: {C_BG}; }}
+QWidget#scanner {{ background: {C_BG}; }}
+QFrame#topbar, QFrame#requestbar, QFrame#panelbar {{ background: {C_PANEL}; border-bottom: 1px solid {C_BORDER}; }}
+QFrame#sidebar {{ background: {C_PANEL}; border-right: 1px solid {C_BORDER}; }}
+QFrame#card {{ background: {C_PANEL2}; border: 1px solid {C_BORDER}; border-radius: 8px; }}
+QLabel#sectionTitle {{ color: {C_MUTED}; font-size: 8pt; font-weight: 600; letter-spacing: 1px; }}
+QLabel#appTitle {{ font-size: 11pt; font-weight: 600; }}
+QLabel#appSubtitle {{ color: {C_DIM}; }}
+QLabel#fieldLabel {{ color: {C_MUTED}; }}
+QLabel#statusDot {{ font-size: 12pt; }}
+QLabel#cardValue {{ font-size: 13pt; font-weight: 600; }}
+QLabel#cardLabel {{ color: {C_MUTED}; font-size: 8pt; }}
+QLabel#hint {{ color: {C_DIM}; }}
+
+QComboBox, QLineEdit, QSpinBox {{
+    background: {C_PANEL2}; border: 1px solid {C_BORDER}; border-radius: 6px;
+    padding: 4px 8px; selection-background-color: {ACCENT}; selection-color: {ACCENT_INK};
 }}
-QGroupBox::title {{
-    subcontrol-origin: margin;
-    subcontrol-position: top left;
-    left: 8px;
-    padding: 0 4px;
-    color: {ACCENT_TEXT};
-    font-weight: bold;
+QComboBox:hover, QLineEdit:hover, QSpinBox:hover {{ border-color: #3a404b; }}
+QComboBox:focus, QLineEdit:focus, QSpinBox:focus {{ border-color: {ACCENT}; }}
+QComboBox:disabled, QLineEdit:disabled, QSpinBox:disabled {{ color: {C_DIM}; background: {C_PANEL}; }}
+QComboBox::drop-down {{ border: none; width: 18px; }}
+QComboBox QAbstractItemView {{
+    background: {C_PANEL2}; border: 1px solid {C_BORDER}; selection-background-color: {C_SEL}; outline: 0;
+}}
+QSpinBox {{ padding-right: 18px; }}
+QSpinBox::up-button, QSpinBox::down-button {{ width: 16px; border: none; background: transparent; }}
+QSpinBox::up-button {{ subcontrol-position: top right; margin-top: 2px; }}
+QSpinBox::down-button {{ subcontrol-position: bottom right; margin-bottom: 2px; }}
+QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background: #2a2f38; border-radius: 3px; }}
+
+QPushButton, QToolButton {{
+    background: {C_PANEL2}; border: 1px solid {C_BORDER}; border-radius: 6px; padding: 5px 10px;
+}}
+QPushButton:hover, QToolButton:hover {{ background: #2a2f38; border-color: #3a404b; }}
+QPushButton:pressed, QToolButton:pressed {{ background: #323843; }}
+QPushButton:checked, QToolButton:checked {{ background: #29361a; border-color: {ACCENT}; color: #dff5b0; }}
+QPushButton:disabled, QToolButton:disabled {{ color: {C_DIM}; }}
+QPushButton#primary {{ background: {ACCENT}; border-color: {ACCENT}; color: {ACCENT_INK}; font-weight: 600; padding: 5px 16px; }}
+QPushButton#primary:hover {{ background: {ACCENT_HOVER}; }}
+QPushButton#primary:disabled {{ background: #3a4a1c; border-color: #3a4a1c; color: #7d8a62; }}
+QPushButton#danger {{ background: #3a2026; border-color: #6b2b35; color: #ffb3b3; font-weight: 600; padding: 5px 16px; }}
+QPushButton#danger:hover {{ background: #4a2830; }}
+QPushButton#segmentLeft {{ border-top-right-radius: 0; border-bottom-right-radius: 0; padding: 5px 12px; }}
+QPushButton#segmentRight {{ border-top-left-radius: 0; border-bottom-left-radius: 0; padding: 5px 12px; margin-left: -1px; }}
+QPushButton#segmentLeft:checked, QPushButton#segmentRight:checked {{ background: #29361a; border-color: {ACCENT}; color: {ACCENT}; font-weight: 600; }}
+
+QTableWidget, QTableView {{
+    background: {C_BG}; alternate-background-color: #171a1f; border: none;
+    gridline-color: transparent; selection-background-color: {C_SEL}; selection-color: {C_TEXT}; outline: 0;
 }}
 QHeaderView::section {{
-    background-color: {ACCENT};
-    color: #1A1A1A;
-    font-weight: bold;
-    padding: 4px;
-    border: none;
-    border-right: 1px solid {ACCENT_BORDER};
+    background: {C_PANEL}; color: {C_MUTED}; border: none; border-bottom: 1px solid {C_BORDER};
+    border-right: 1px solid {C_BORDER}; padding: 4px 8px; font-size: 8pt; font-weight: 600;
 }}
-QTableWidget {{
-    gridline-color: #D0D7E0;
-    selection-background-color: {ACCENT};
-    selection-color: #1A1A1A;
-}}
-QStatusBar {{
-    background-color: {ACCENT};
-    color: #1A1A1A;
-}}
-QStatusBar QLabel {{
-    color: #1A1A1A;
-}}
+QTableCornerButton::section {{ background: {C_PANEL}; border: none; }}
+QPlainTextEdit {{ background: {C_BG}; border: none; selection-background-color: {ACCENT}; selection-color: {ACCENT_INK}; }}
+QGroupBox {{ border: 1px solid {C_BORDER}; border-radius: 8px; margin-top: 12px; padding: 10px 8px 6px 8px; }}
+QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; color: {C_MUTED}; font-size: 8pt; font-weight: 600; }}
+QCheckBox {{ spacing: 6px; }}
+QCheckBox::indicator {{ width: 14px; height: 14px; border: 1px solid #3a404b; border-radius: 4px; background: {C_PANEL2}; }}
+QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; }}
+QProgressBar {{ background: {C_PANEL2}; border: 1px solid {C_BORDER}; border-radius: 6px; text-align: center; color: {C_TEXT}; }}
+QProgressBar::chunk {{ background: {ACCENT}; border-radius: 5px; }}
+QSplitter::handle {{ background: {C_BORDER}; }}
+QSplitter::handle:horizontal {{ width: 1px; }}
+QSplitter::handle:vertical {{ height: 1px; }}
+QStatusBar {{ background: {C_PANEL}; border-top: 1px solid {C_BORDER}; color: {C_MUTED}; }}
+QStatusBar QLabel {{ color: {C_MUTED}; padding: 0 8px; }}
+QStatusBar::item {{ border: none; }}
+QMenu {{ background: {C_PANEL2}; border: 1px solid {C_BORDER}; padding: 4px; }}
+QMenu::item {{ padding: 6px 20px; border-radius: 4px; }}
+QMenu::item:selected {{ background: {C_SEL}; }}
+QScrollBar:vertical {{ background: transparent; width: 11px; margin: 0; }}
+QScrollBar::handle:vertical {{ background: #343a45; border-radius: 4px; min-height: 30px; margin: 2px; }}
+QScrollBar::handle:vertical:hover {{ background: #454c59; }}
+QScrollBar:horizontal {{ background: transparent; height: 11px; margin: 0; }}
+QScrollBar::handle:horizontal {{ background: #343a45; border-radius: 4px; min-width: 30px; margin: 2px; }}
+QScrollBar::add-line, QScrollBar::sub-line {{ width: 0; height: 0; }}
+QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+QToolTip {{ background: {C_PANEL2}; color: {C_TEXT}; border: 1px solid {C_BORDER}; padding: 4px; }}
+QMessageBox QLabel {{ color: {C_TEXT}; }}
 """
+
+
+def rgba(hex_color, alpha):
+    c = QColor(hex_color)
+    return f"rgba({c.red()},{c.green()},{c.blue()},{alpha})"
+
+
+def pill_style(color):
+    """Styl przełącznika-'pigułki' (filtry logu) w danym kolorze."""
+    return (f"QPushButton {{ border-radius: 12px; padding: 3px 12px; color: {C_DIM};"
+            f" background: transparent; border: 1px solid {C_BORDER}; }}"
+            f"QPushButton:hover {{ border-color: {rgba(color, 0.6)}; }}"
+            f"QPushButton:checked {{ color: {color}; background: {rgba(color, 0.13)}; border-color: {rgba(color, 0.55)}; }}")
+
+
+def apply_theme(app):
+    """Ciemna paleta Fusion + arkusz stylów aplikacji."""
+    app.setStyle("Fusion")
+    pal = QPalette()
+    for role, col in (
+        (QPalette.ColorRole.Window, C_BG), (QPalette.ColorRole.Base, C_BG),
+        (QPalette.ColorRole.AlternateBase, "#171a1f"), (QPalette.ColorRole.Button, C_PANEL2),
+        (QPalette.ColorRole.Text, C_TEXT), (QPalette.ColorRole.WindowText, C_TEXT),
+        (QPalette.ColorRole.ButtonText, C_TEXT), (QPalette.ColorRole.Highlight, C_SEL),
+        (QPalette.ColorRole.HighlightedText, C_TEXT), (QPalette.ColorRole.ToolTipBase, C_PANEL2),
+        (QPalette.ColorRole.ToolTipText, C_TEXT), (QPalette.ColorRole.PlaceholderText, C_DIM),
+    ):
+        pal.setColor(role, QColor(col))
+    app.setPalette(pal)
+    app.setStyleSheet(ACCENT_STYLESHEET + theme_images_qss()
+                      + f'QTableWidget, QPlainTextEdit {{ font-family: "{mono_family()}"; }}')
+
+
+def theme_images_qss():
+    """Strzałki list/pól liczbowych i znacznik checkboxa - QSS przyjmuje tylko pliki, więc są rysowane do katalogu tymczasowego."""
+    folder = os.path.join(tempfile.gettempdir(), "pymms_theme")
+    os.makedirs(folder, exist_ok=True)
+
+    def draw(name, color, painter_fn, w=10, h=10):
+        path = os.path.join(folder, name)
+        pm = QPixmap(w * 2, h * 2)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.scale(2, 2)
+        painter_fn(p, QColor(color))
+        p.end()
+        pm.save(path)
+        return path.replace("\\", "/")
+
+    def arrow(up):
+        def fn(p, color):
+            pen = QPen(color, 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+            p.setPen(pen)
+            if up:
+                p.drawPolyline(QPolygonF([QPointF(2, 6.5), QPointF(5, 3.5), QPointF(8, 6.5)]))
+            else:
+                p.drawPolyline(QPolygonF([QPointF(2, 3.5), QPointF(5, 6.5), QPointF(8, 3.5)]))
+        return fn
+
+    def check(p, color):
+        pen = QPen(color, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.drawPolyline(QPolygonF([QPointF(2.5, 5.2), QPointF(4.4, 7.2), QPointF(7.8, 3)]))
+
+    up, down = draw("up.png", C_MUTED, arrow(True)), draw("down.png", C_MUTED, arrow(False))
+    up_dis, down_dis = draw("up_dis.png", C_DIM, arrow(True)), draw("down_dis.png", C_DIM, arrow(False))
+    tick = draw("check.png", ACCENT_INK, check)
+    return f"""
+QSpinBox::up-arrow {{ image: url({up}); width: 10px; height: 10px; }}
+QSpinBox::down-arrow {{ image: url({down}); width: 10px; height: 10px; }}
+QSpinBox::up-arrow:disabled {{ image: url({up_dis}); }}
+QSpinBox::down-arrow:disabled {{ image: url({down_dis}); }}
+QComboBox::down-arrow {{ image: url({down}); width: 10px; height: 10px; margin-right: 6px; }}
+QComboBox::down-arrow:disabled {{ image: url({down_dis}); }}
+QCheckBox::indicator:checked {{ image: url({tick}); }}
+"""
+
+
+_ICON_FONT = None
+
+def icon(glyph, color=C_TEXT, size=16):
+    """Ikona z fontu Segoe Fluent Icons / Segoe MDL2 Assets (Windows 10/11)."""
+    global _ICON_FONT
+    if _ICON_FONT is None:
+        families = QFontDatabase.families()
+        _ICON_FONT = next((f for f in ("Segoe Fluent Icons", "Segoe MDL2 Assets") if f in families), "")
+    if not _ICON_FONT:
+        return QIcon()
+    result = QIcon()
+    for scale in (1, 2):
+        pm = QPixmap(size * scale, size * scale)
+        pm.setDevicePixelRatio(scale)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        f = QFont(_ICON_FONT)
+        f.setPixelSize(int(size * 0.8))
+        p.setFont(f)
+        p.setPen(QColor(color))
+        p.drawText(QRect(0, 0, size, size), Qt.AlignmentFlag.AlignCenter, glyph)
+        p.end()
+        result.addPixmap(pm)
+    return result
+
+G_REFRESH, G_PLAY, G_STOP, G_DELETE, G_SAVE = "", "", "", "", ""
+G_SEARCH, G_DOWN, G_PLUG, G_SYNC, G_LIST, G_PAUSE = "", "", "", "", "", ""
+
+
+def mono_family():
+    families = QFontDatabase.families()
+    return next((f for f in ("Cascadia Mono", "Cascadia Code", "JetBrains Mono", "Consolas") if f in families), "Courier New")
+
+
+def mono_font(pt=9.5):
+    f = QFont(mono_family())
+    f.setPointSizeF(pt)
+    f.setStyleHint(QFont.StyleHint.Monospace)
+    return f
+
+
+def repolish(widget):
+    widget.style().unpolish(widget)
+    widget.style().polish(widget)
 
 
 # --- Własna obsługa Modbus master (TCP / RTU) ---
@@ -522,66 +735,64 @@ class ModbusRtuMaster(ModbusMasterBase):
         return response
 
 
-class LogWindow(QWidget):
-    """Okno pokazujące dokładną transmisję (surowe ramki HEX + dekodowanie) - jak w pymss."""
-    COLORS = {"RX": "#0050B4", "TX": "#007A00", "INFO": "#606060", "ERROR": "#C00000"}
+class LogPanel(QWidget):
+    """Panel logu transmisji (surowe ramki HEX + dekodowanie), zadokowany pod tabelą wyników."""
+    COLORS = {"RX": C_BLUE, "TX": C_GREEN, "INFO": C_MUTED, "ERROR": STATUS_RED}
 
     def __init__(self, parent=None):
-        super().__init__(parent, Qt.WindowType.Window)
-        self.setWindowTitle("pymms - Transmission Log")
-        self.resize(1100, 500)
+        super().__init__(parent)
         self.entry_count = 0
         self.dropped_count = 0
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        options_layout = QHBoxLayout()
-        self.show_rx_cb = QCheckBox("RX")
-        self.show_tx_cb = QCheckBox("TX")
-        self.show_info_cb = QCheckBox("Info")
-        self.show_errors_cb = QCheckBox("Errors")
-        self.decode_cb = QCheckBox("Decode frames")
-        self.autoscroll_cb = QCheckBox("Auto-scroll")
-        self.pause_cb = QCheckBox("Pause")
-        for cb in (self.show_rx_cb, self.show_tx_cb, self.show_info_cb, self.show_errors_cb,
-                   self.decode_cb, self.autoscroll_cb):
-            cb.setChecked(True)
-        for cb in (self.show_rx_cb, self.show_tx_cb, self.show_info_cb, self.show_errors_cb):
-            options_layout.addWidget(cb)
-        options_layout.addSpacing(20)
-        options_layout.addWidget(self.decode_cb)
-        options_layout.addWidget(self.autoscroll_cb)
-        options_layout.addWidget(self.pause_cb)
-        options_layout.addSpacing(20)
-        options_layout.addWidget(QLabel("Max lines:"))
+        bar = QFrame(objectName="panelbar")
+        bl = QHBoxLayout(bar)
+        bl.setContentsMargins(14, 6, 14, 6)
+        bl.setSpacing(6)
+        bl.addWidget(QLabel("TRANSMISSION LOG", objectName="sectionTitle"))
+        bl.addSpacing(10)
+        self.show_tx_cb = self._pill("TX", self.COLORS["TX"], "Requests sent by pymms")
+        self.show_rx_cb = self._pill("RX", self.COLORS["RX"], "Responses received from the device")
+        self.show_info_cb = self._pill("Info", self.COLORS["INFO"], "Connection events")
+        self.show_errors_cb = self._pill("Errors", self.COLORS["ERROR"], "Timeouts, CRC errors, discarded frames")
+        for b in (self.show_tx_cb, self.show_rx_cb, self.show_info_cb, self.show_errors_cb):
+            bl.addWidget(b)
+        bl.addSpacing(10)
+        self.decode_cb = QPushButton("Decode", checkable=True, checked=True, toolTip="Decode frames (function, address, values)")
+        bl.addWidget(self.decode_cb)
+        self.autoscroll_cb = QPushButton("Follow", checkable=True, checked=True, icon=icon(G_DOWN),
+                                         toolTip="Scroll to the newest entries automatically")
+        bl.addWidget(self.autoscroll_cb)
+        self.pause_cb = QPushButton("Pause", checkable=True, icon=icon(G_PAUSE), toolTip="Stop adding new entries")
+        bl.addWidget(self.pause_cb)
+        bl.addStretch(1)
+        self.info_label = QLabel(objectName="hint")
+        bl.addWidget(self.info_label)
+        bl.addSpacing(6)
+        bl.addWidget(QLabel("Max lines", objectName="fieldLabel"))
         self.max_lines_sb = QSpinBox()
         self.max_lines_sb.setRange(100, 1000000)
         self.max_lines_sb.setSingleStep(1000)
         self.max_lines_sb.setValue(20000)
         self.max_lines_sb.valueChanged.connect(lambda v: self.text.setMaximumBlockCount(v))
-        options_layout.addWidget(self.max_lines_sb)
-        options_layout.addStretch()
-        self.clear_btn = QPushButton("Clear")
+        bl.addWidget(self.max_lines_sb)
+        self.clear_btn = QPushButton("Clear", icon=icon(G_DELETE))
         self.clear_btn.clicked.connect(self.clear)
-        options_layout.addWidget(self.clear_btn)
-        self.save_btn = QPushButton("Save...")
+        bl.addWidget(self.clear_btn)
+        self.save_btn = QPushButton("Save", icon=icon(G_SAVE), toolTip="Save the log to a text file")
         self.save_btn.clicked.connect(self.save)
-        options_layout.addWidget(self.save_btn)
-        layout.addLayout(options_layout)
+        bl.addWidget(self.save_btn)
+        layout.addWidget(bar)
 
-        self.text = QPlainTextEdit()
-        self.text.setReadOnly(True)
+        self.text = QPlainTextEdit(readOnly=True)
         self.text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.text.setMaximumBlockCount(self.max_lines_sb.value())
-        font = QFont("Consolas")
-        font.setStyleHint(QFont.StyleHint.Monospace)
-        font.setPointSize(9)
-        self.text.setFont(font)
+        self.text.setFont(mono_font(9))
+        self.text.setPlaceholderText("Frames sent and received by pymms appear here")
         layout.addWidget(self.text)
-
-        self.info_label = QLabel()
-        self.info_label.setStyleSheet(f"background-color: {ACCENT}; color: #1A1A1A; padding: 3px 6px;")
-        layout.addWidget(self.info_label)
         self.update_info()
 
         self.formats = {}
@@ -589,11 +800,21 @@ class LogWindow(QWidget):
             fmt = QTextCharFormat()
             fmt.setForeground(QColor(color))
             self.formats[kind] = fmt
+        self.decode_format = QTextCharFormat()
+        self.decode_format.setForeground(QColor(C_MUTED))
+        self.time_format = QTextCharFormat()
+        self.time_format.setForeground(QColor(C_DIM))
+
+    @staticmethod
+    def _pill(text, color, tooltip):
+        b = QPushButton(text, checkable=True, checked=True, toolTip=tooltip)
+        b.setStyleSheet(pill_style(color))
+        return b
 
     def update_info(self):
-        text = f"Entries: {self.entry_count}"
+        text = f"{self.entry_count:,} entries".replace(",", " ")
         if self.dropped_count:
-            text += f" | Skipped while paused: {self.dropped_count}"
+            text += f"  ·  {self.dropped_count} skipped while paused"
         self.info_label.setText(text)
 
     def add_entry(self, entry):
@@ -607,19 +828,20 @@ class LogWindow(QWidget):
         if not visible:
             return
 
-        line = f"{timestamp:%H:%M:%S}.{timestamp.microsecond // 1000:03d}  {kind:<5} [{channel}]"
-        if data:
-            line += f"  ({len(data):>3} B)  {to_hex(data)}"
-            if self.decode_cb.isChecked() and text:
-                line += f"\n{'':<20}-> {text}" # dekodowanie w osobnej, wciętej linii
-        else:
-            line += f"  {text}"
-
         cursor = QTextCursor(self.text.document())
         cursor.movePosition(QTextCursor.MoveOperation.End)
         if not self.text.document().isEmpty():
             cursor.insertBlock()
-        cursor.insertText(line, self.formats[kind])
+        cursor.insertText(f"{timestamp:%H:%M:%S}.{timestamp.microsecond // 1000:03d}  ", self.time_format)
+        line = f"{kind:<5} [{channel}]"
+        if data:
+            line += f"  ({len(data):>3} B)  {to_hex(data)}"
+            cursor.insertText(line, self.formats[kind])
+            if self.decode_cb.isChecked() and text:
+                cursor.insertBlock()
+                cursor.insertText(f"{'':<20}-> {text}", self.decode_format) # dekodowanie w osobnej, wciętej linii
+        else:
+            cursor.insertText(f"{line}  {text}", self.formats[kind])
         if self.autoscroll_cb.isChecked():
             bar = self.text.verticalScrollBar()
             bar.setValue(bar.maximum())
@@ -830,7 +1052,7 @@ class ScannerWindow(QWidget):
         ("0x02 (Discrete Inputs)", 0x02, "read_discrete_inputs", "discrete_input"),
     ]
     COLUMNS = ["Slave ID", "Address", "Address (HEX)", "Status", "Time (ms)", "Value (HEX)", "Value"]
-    STATUS_COLORS = {"ok": QColor(214, 240, 170), "exception": QColor(255, 226, 170), "error": QColor(255, 200, 200)}
+    STATUS_COLORS = {"ok": QColor(143, 206, 0, 34), "exception": QColor(242, 180, 60, 40), "error": QColor(255, 95, 95, 40)}
 
     def __init__(self, app_window):
         super().__init__(app_window, Qt.WindowType.Window)
@@ -932,21 +1154,21 @@ class ScannerWindow(QWidget):
 
         # --- Sterowanie ---
         controls = QHBoxLayout()
-        self.start_btn = QPushButton("Start Scan")
+        self.start_btn = QPushButton("Start Scan", objectName="primary", icon=icon(G_PLAY, ACCENT_INK))
         self.start_btn.clicked.connect(self.start_scan)
         controls.addWidget(self.start_btn)
-        self.stop_btn = QPushButton("Stop")
+        self.stop_btn = QPushButton("Stop", icon=icon(G_STOP))
         self.stop_btn.clicked.connect(lambda: self.finish_scan("Scan stopped by user."))
         self.stop_btn.setEnabled(False)
         controls.addWidget(self.stop_btn)
         self.progress = QProgressBar()
         self.progress.setTextVisible(True)
         controls.addWidget(self.progress, 1)
-        self.export_btn = QPushButton("Export CSV...")
+        self.export_btn = QPushButton("Export CSV...", icon=icon(G_SAVE))
         self.export_btn.setToolTip("Saves successful readings as a pymss register map (can be imported into pymss)")
         self.export_btn.clicked.connect(self.export_csv)
         controls.addWidget(self.export_btn)
-        self.clear_btn = QPushButton("Clear")
+        self.clear_btn = QPushButton("Clear", icon=icon(G_DELETE))
         self.clear_btn.clicked.connect(self.clear_results)
         controls.addWidget(self.clear_btn)
         layout.addLayout(controls)
@@ -957,14 +1179,18 @@ class ScannerWindow(QWidget):
         self.table.setHorizontalHeaderLabels(self.COLUMNS)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setShowGrid(False)
+        self.table.setFont(mono_font())
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(24)
+        self.table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         for col, width in enumerate([70, 90, 100, 300, 75, 150]):
             self.table.setColumnWidth(col, width)
         self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table)
 
         self.summary_label = QLabel("Ready")
-        self.summary_label.setStyleSheet(f"background-color: {ACCENT}; color: #1A1A1A; padding: 3px 6px;")
+        self.summary_label.setStyleSheet(f"background: {C_PANEL}; border: 1px solid {C_BORDER}; border-radius: 6px; color: {C_MUTED}; padding: 5px 8px;")
         layout.addWidget(self.summary_label)
 
     @staticmethod
@@ -1247,318 +1473,318 @@ class ModbusValueEditor(QDialog):
 
 class ModbusClientApp(QMainWindow):
     # Wersja aplikacji, która będzie inkrementowana
-    __version__ = "1.13"
+    __version__ = "1.16"
+
+    FUNCTIONS = ["0x03 (Holding Registers)", "0x04 (Input Registers)", "0x01 (Coils)", "0x02 (Discrete Inputs)"]
+    DATA_TYPES = ["UINT16 (16-bit Unsigned)", "INT16 (16-bit Signed)",
+                  "UINT32 (32-bit Unsigned)", "INT32 (32-bit Signed)", "FLOAT32 (32-bit Float)",
+                  "UINT64 (64-bit Unsigned)", "INT64 (64-bit Signed)", "FLOAT64 (64-bit Double)"]
+    BYTE_ORDERS = ["ABCD (No Swap)", "CDAB (Word Swap)", "BADC (Byte Swap within Words)", "DCBA (Full Byte Reverse)"]
+    BAUD_RATES = ["1200", "2400", "4800", "9600", "19200", "38400", "57600", "115200"]
 
     def __init__(self):
         super().__init__()
-        # Zmieniono tytuł aplikacji, dodając numer wersji
+        apply_theme(QApplication.instance())
         self.setWindowTitle(f"pymms (Python Modbus Master Simulator) v{self.__version__}")
-        self.setGeometry(100, 100, 900, 650) # x, y, width, height
-
-        # Ustawienie ikony aplikacji
-        try:
-            self.setWindowIcon(QIcon(resource_path('icon.png')))
-        except Exception as e:
-            # W przypadku problemów z ładowaniem ikony, wyświetl błąd na pasku statusu (jeśli jest już zainicjalizowany)
-            # Lub po prostu wypisz do konsoli, jeśli pasku statusu jeszcze nie ma
-            print(f"Błąd ładowania ikony: {e}. Upewnij się, że plik 'icon.png' znajduje się w tym samym folderze co aplikacja.")
-
+        self.setWindowIcon(QIcon(resource_path('icon.png')))
+        self.settings = open_settings() # pymms.ini obok programu
 
         self.modbus_client = None
         self.connection_type = "RTU" # Default connection type
-        self.log_window = LogWindow(self) # Okno logów transmisji
         self.scanner_window = None # Okno skanera (tworzone przy pierwszym otwarciu)
-
-        # Initialize button attributes before calling init_ui
-        self.connect_btn = None
-        self.disconnect_btn = None
-        self.read_data_btn = None # Renamed from read_holding_registers_btn
-        self.start_cyclic_read_btn = None # New button for cyclic read
-        self.stop_cyclic_read_btn = None  # New button for cyclic read
         self.polling_timer = QTimer(self) # Initialize QTimer
         self.polling_timer.timeout.connect(self.read_modbus_data) # Connect timer to read function
 
         # Statistics variables
         self.total_polls = 0
-        self.failed_polls = 0 # Now storing failed polls
+        self.failed_polls = 0
         self.last_response_time = 0.0
         self.sum_response_times = 0.0
         self.average_response_time = 0.0
 
         self.init_ui()
+        self.restore_settings()
+        self.update_connection_buttons()
+        self.update_status_bar_stats()
+
+    # --- Budowa interfejsu ---
+
+    @staticmethod
+    def _field(text):
+        return QLabel(text, objectName="fieldLabel")
+
+    @staticmethod
+    def _spin(minimum, maximum, value, suffix="", width=None):
+        sb = QSpinBox()
+        sb.setRange(minimum, maximum)
+        sb.setValue(value)
+        if suffix:
+            sb.setSuffix(suffix)
+        if width:
+            sb.setMinimumWidth(width)
+        return sb
 
     def init_ui(self):
         """Initializes the user interface."""
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout()
-        central_widget.setLayout(main_layout)
+        central = QWidget(objectName="central")
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        # --- Connection Configuration Section ---
-        connection_group = QGroupBox("Connection Configuration")
-        connection_layout = QHBoxLayout()
-        connection_group.setLayout(connection_layout)
+        # --- Pasek połączenia ---
+        top = QFrame(objectName="topbar")
+        tl = QHBoxLayout(top)
+        tl.setContentsMargins(14, 10, 14, 10)
+        tl.setSpacing(8)
+        logo = QLabel()
+        logo.setPixmap(QIcon(resource_path('icon.png')).pixmap(26, 26))
+        tl.addWidget(logo)
+        title_box = QVBoxLayout()
+        title_box.setSpacing(0)
+        title_box.addWidget(QLabel("pymms", objectName="appTitle"))
+        title_box.addWidget(QLabel("Modbus Master", objectName="appSubtitle"))
+        tl.addLayout(title_box)
+        tl.addSpacing(16)
 
-        # Connection Type
-        connection_layout.addWidget(QLabel("Type:"))
-        self.connection_type_cb = QComboBox()
-        self.connection_type_cb.addItems(["RTU (Serial)", "TCP/IP"])
-        self.connection_type_cb.currentIndexChanged.connect(self.on_connection_type_changed)
-        connection_layout.addWidget(self.connection_type_cb)
+        self.rtu_btn = QPushButton("RTU", objectName="segmentLeft", checkable=True, checked=True,
+                                   toolTip="Modbus RTU over a serial port")
+        self.tcp_btn = QPushButton("TCP", objectName="segmentRight", checkable=True, toolTip="Modbus TCP/IP")
+        self.type_group = QButtonGroup(self)
+        self.type_group.setExclusive(True)
+        self.type_group.addButton(self.rtu_btn, 0)
+        self.type_group.addButton(self.tcp_btn, 1)
+        self.type_group.idClicked.connect(self.on_connection_type_changed)
+        seg = QHBoxLayout()
+        seg.setSpacing(0)
+        seg.addWidget(self.rtu_btn)
+        seg.addWidget(self.tcp_btn)
+        tl.addLayout(seg)
+        tl.addSpacing(6)
 
         # RTU Parameters
-        self.rtu_params_widget = QWidget() # New widget for RTU parameters
-        self.rtu_params_layout = QHBoxLayout(self.rtu_params_widget) # Set layout for this widget
-        self.rtu_params_layout.addWidget(QLabel("COM Port:"))
-        self.com_port_cb = QComboBox()
-        self.com_port_cb.setMinimumWidth(110)
-        self.populate_com_ports() # Populate list of available COM ports
-        self.rtu_params_layout.addWidget(self.com_port_cb)
-        self.refresh_ports_btn = QPushButton("↻")
-        self.refresh_ports_btn.setToolTip("Refresh COM port list")
-        self.refresh_ports_btn.setFixedWidth(28)
+        self.rtu_params_widget = QWidget()
+        rl = QHBoxLayout(self.rtu_params_widget)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(6)
+        self.com_port_cb = QComboBox(minimumWidth=220, toolTip="Serial port")
+        rl.addWidget(self.com_port_cb)
+        self.refresh_ports_btn = QToolButton(icon=icon(G_REFRESH), toolTip="Refresh COM port list")
         self.refresh_ports_btn.clicked.connect(self.populate_com_ports)
-        self.rtu_params_layout.addWidget(self.refresh_ports_btn)
-        self.rtu_params_layout.addWidget(QLabel("Baud Rate:"))
-        self.baud_rate_cb = QComboBox()
-        self.baud_rate_cb.addItems(["9600", "19200", "38400", "57600", "115200"])
+        rl.addWidget(self.refresh_ports_btn)
+        self.baud_rate_cb = QComboBox(editable=True, minimumWidth=90, toolTip="Baud rate [bps]")
+        self.baud_rate_cb.addItems(self.BAUD_RATES)
         self.baud_rate_cb.setCurrentText("9600")
-        self.rtu_params_layout.addWidget(self.baud_rate_cb)
-        self.rtu_params_layout.addWidget(QLabel("Parity:"))
-        self.parity_cb = QComboBox()
-        self.parity_cb.addItems(["N", "E", "O"]) # None, Even, Odd
-        self.parity_cb.setCurrentText("N")
-        self.rtu_params_layout.addWidget(self.parity_cb)
-        self.rtu_params_layout.addWidget(QLabel("Data Bits:"))
-        self.data_bits_cb = QComboBox()
+        rl.addWidget(self.baud_rate_cb)
+        self.data_bits_cb = QComboBox(toolTip="Data bits")
         self.data_bits_cb.addItems(["7", "8"])
         self.data_bits_cb.setCurrentText("8")
-        self.rtu_params_layout.addWidget(self.data_bits_cb)
-        self.rtu_params_layout.addWidget(QLabel("Stop Bits:"))
-        self.stop_bits_cb = QComboBox()
+        rl.addWidget(self.data_bits_cb)
+        self.parity_cb = QComboBox(toolTip="Parity: N - none, E - even, O - odd")
+        self.parity_cb.addItems(["N", "E", "O"])
+        rl.addWidget(self.parity_cb)
+        self.stop_bits_cb = QComboBox(toolTip="Stop bits")
         self.stop_bits_cb.addItems(["1", "2"])
-        self.stop_bits_cb.setCurrentText("1")
-        self.rtu_params_layout.addWidget(self.stop_bits_cb)
+        rl.addWidget(self.stop_bits_cb)
+        tl.addWidget(self.rtu_params_widget)
+        self.populate_com_ports()
 
         # TCP Parameters
-        self.tcp_params_widget = QWidget() # New widget for TCP parameters
-        self.tcp_params_layout = QHBoxLayout(self.tcp_params_widget) # Set layout for this widget
-        self.tcp_params_layout.addWidget(QLabel("IP Address:"))
-        self.ip_address_le = QLineEdit("192.168.1.1")
-        self.tcp_params_layout.addWidget(self.ip_address_le)
-        self.tcp_params_layout.addWidget(QLabel("Port:"))
-        self.port_le = QLineEdit("502")
-        self.tcp_params_layout.addWidget(self.port_le)
+        self.tcp_params_widget = QWidget()
+        cl = QHBoxLayout(self.tcp_params_widget)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(6)
+        self.ip_address_le = QLineEdit("192.168.1.1", minimumWidth=150, placeholderText="IP address / host name",
+                                       toolTip="IP address or host name of the Modbus TCP device")
+        cl.addWidget(self.ip_address_le)
+        cl.addWidget(self._field(":"))
+        self.port_le = QLineEdit("502", maximumWidth=64, toolTip="TCP port")
+        cl.addWidget(self.port_le)
+        tl.addWidget(self.tcp_params_widget)
+        self.tcp_params_widget.hide()
 
-        connection_layout.addWidget(self.rtu_params_widget) # Add widget to main connection layout
-        connection_layout.addWidget(self.tcp_params_widget) # Add widget to main connection layout
-        self.tcp_params_widget.hide() # Hide TCP at start
+        tl.addSpacing(6)
+        tl.addWidget(self._field("Timeout"))
+        self.timeout_ms_sb = self._spin(100, 30000, 500, " ms")
+        self.timeout_ms_sb.setToolTip("Response timeout")
+        tl.addWidget(self.timeout_ms_sb)
 
-        # Timeout Parameter
-        connection_layout.addWidget(QLabel("Timeout (ms):"))
-        self.timeout_ms_sb = QSpinBox()
-        self.timeout_ms_sb.setRange(100, 30000) # 100ms to 30 seconds
-        self.timeout_ms_sb.setValue(500) # Default 1 second
-        connection_layout.addWidget(self.timeout_ms_sb)
+        self.connect_btn = QPushButton("Connect", objectName="primary", icon=icon(G_PLUG, ACCENT_INK))
+        self.connect_btn.clicked.connect(self.toggle_connection)
+        tl.addWidget(self.connect_btn)
 
-        # Connection Buttons
-        self.connect_btn = QPushButton("Connect")
-        self.connect_btn.clicked.connect(self.connect_modbus)
-        connection_layout.addWidget(self.connect_btn)
-        self.disconnect_btn = QPushButton("Disconnect")
-        self.disconnect_btn.clicked.connect(self.disconnect_modbus)
-        self.disconnect_btn.setEnabled(False) # Set initial state
-        connection_layout.addWidget(self.disconnect_btn)
+        tl.addStretch(1)
+        self.state_dot = QLabel("●", objectName="statusDot")
+        self.state_label = QLabel("Disconnected")
+        tl.addWidget(self.state_dot)
+        tl.addWidget(self.state_label)
+        root.addWidget(top)
 
-        main_layout.addWidget(connection_group)
-
-        # --- Read / Write Section ---
-        read_write_group = QGroupBox("Modbus Operations")
-        rw_layout = QVBoxLayout()
-        read_write_group.setLayout(rw_layout)
-
-        # Read Parameters
-        read_params_layout = QHBoxLayout()
-        read_params_layout.addWidget(QLabel("Slave ID:"))
-        self.slave_id_sb = QSpinBox()
-        self.slave_id_sb.setRange(1, 247) # Modbus slave ID range
-        self.slave_id_sb.setValue(1)
-        read_params_layout.addWidget(self.slave_id_sb)
-        read_params_layout.addWidget(QLabel("Start Address:"))
-        self.start_address_sb = QSpinBox()
-        self.start_address_sb.setRange(0, 65535) # Modbus register address range
-        self.start_address_sb.setValue(0)
-        read_params_layout.addWidget(self.start_address_sb)
-        read_params_layout.addWidget(QLabel("Quantity:"))
-        self.num_registers_sb = QSpinBox()
-        self.num_registers_sb.setRange(1, 2000) # Max quantity for coils/discrete inputs is 2000, for registers is 125
-        self.num_registers_sb.setValue(10)
-        read_params_layout.addWidget(self.num_registers_sb)
-
-        # Modbus Function Selection
-        self.modbus_function_cb = QComboBox()
-        self.modbus_function_cb.addItems([
-            "0x03 (Holding Registers)",
-            "0x04 (Input Registers)",
-            "0x01 (Coils)",
-            "0x02 (Discrete Inputs)"
-        ])
-        self.modbus_function_cb.setCurrentText("0x03 (Holding Registers)")
+        # --- Pasek zapytania ---
+        req = QFrame(objectName="requestbar")
+        ql = QHBoxLayout(req)
+        ql.setContentsMargins(14, 8, 14, 8)
+        ql.setSpacing(6)
+        ql.addWidget(self._field("Slave ID"))
+        self.slave_id_sb = self._spin(1, 247, 1, width=64)
+        ql.addWidget(self.slave_id_sb)
+        ql.addSpacing(6)
+        ql.addWidget(self._field("Function"))
+        self.modbus_function_cb = QComboBox(minimumWidth=180)
+        self.modbus_function_cb.addItems(self.FUNCTIONS)
         self.modbus_function_cb.currentIndexChanged.connect(self.on_modbus_function_changed)
-        read_params_layout.addWidget(self.modbus_function_cb)
-
-
-        self.read_data_btn = QPushButton("Read Data") # Renamed button
+        ql.addWidget(self.modbus_function_cb)
+        ql.addSpacing(6)
+        ql.addWidget(self._field("Address"))
+        self.start_address_sb = self._spin(0, 65535, 0, width=80)
+        ql.addWidget(self.start_address_sb)
+        ql.addWidget(self._field("Quantity"))
+        self.num_registers_sb = self._spin(1, 125, 10, width=70)
+        ql.addWidget(self.num_registers_sb)
+        self.read_data_btn = QPushButton("Read", objectName="primary", icon=icon(G_DOWN, ACCENT_INK),
+                                         toolTip="Read once")
         self.read_data_btn.clicked.connect(self.read_modbus_data)
-        self.read_data_btn.setEnabled(False) # Set initial state
-        read_params_layout.addWidget(self.read_data_btn)
-        read_params_layout.addStretch() # Stretch to push buttons to the right
-
-        self.show_scanner_btn = QPushButton("Scanner")
-        self.show_scanner_btn.setToolTip("Scan Slave IDs or register addresses")
+        ql.addWidget(self.read_data_btn)
+        ql.addSpacing(14)
+        self.cyclic_btn = QPushButton("Cyclic read", checkable=True, icon=icon(G_SYNC),
+                                      toolTip="Repeat the read with the given interval")
+        self.cyclic_btn.toggled.connect(self.on_cyclic_toggled)
+        ql.addWidget(self.cyclic_btn)
+        ql.addWidget(self._field("every"))
+        self.polling_interval_ms_sb = self._spin(100, 60000, 1000, " ms", width=90)
+        ql.addWidget(self.polling_interval_ms_sb)
+        ql.addStretch(1)
+        self.show_scanner_btn = QPushButton("Scanner", icon=icon(G_SEARCH), toolTip="Scan Slave IDs or register addresses")
         self.show_scanner_btn.clicked.connect(self.show_scanner_window)
-        read_params_layout.addWidget(self.show_scanner_btn)
+        ql.addWidget(self.show_scanner_btn)
+        self.show_log_btn = QPushButton("Log", checkable=True, checked=True, icon=icon(G_LIST),
+                                        toolTip="Show / hide the transmission log")
+        self.show_log_btn.toggled.connect(self.on_log_toggled)
+        ql.addWidget(self.show_log_btn)
+        root.addWidget(req)
 
-        self.show_log_btn = QPushButton("Transmission Log")
-        self.show_log_btn.clicked.connect(self.show_log_window)
-        read_params_layout.addWidget(self.show_log_btn)
+        # --- Ciało: panel boczny | wyniki + log ---
+        self.hsplit = QSplitter(Qt.Orientation.Horizontal, childrenCollapsible=False)
+        root.addWidget(self.hsplit, 1)
 
-        rw_layout.addLayout(read_params_layout)
-
-        # New layout to hold Data Interpretation and Cyclic Read Options side-by-side
-        interpretation_and_polling_layout = QHBoxLayout()
-
-        # Data Interpretation Type (Left side of new layout)
-        data_type_group = QGroupBox("Data Interpretation")
-        data_type_vbox = QVBoxLayout()
-        data_type_group.setLayout(data_type_vbox)
-
-        data_type_h_layout = QHBoxLayout()
-        data_type_h_layout.addWidget(QLabel("Interpret as:"))
+        side = QFrame(objectName="sidebar")
+        side.setMinimumWidth(220)
+        sl = QVBoxLayout(side)
+        sl.setContentsMargins(14, 14, 14, 12)
+        sl.setSpacing(6)
+        sl.addWidget(QLabel("DATA INTERPRETATION", objectName="sectionTitle"))
+        sl.addWidget(self._field("Interpret as"))
         self.data_type_cb = QComboBox()
-        self.data_type_cb.addItems(["UINT16 (16-bit Unsigned)", "INT16 (16-bit Signed)",
-                                    "UINT32 (32-bit Unsigned)", "INT32 (32-bit Signed)",
-                                    "FLOAT32 (32-bit Float)",
-                                    "UINT64 (64-bit Unsigned)", "INT64 (64-bit Signed)",
-                                    "FLOAT64 (64-bit Double)"]) # Added 64-bit types
-        self.data_type_cb.setCurrentText("UINT16 (16-bit Unsigned)")
+        self.data_type_cb.addItems(self.DATA_TYPES)
         self.data_type_cb.currentIndexChanged.connect(self.on_modbus_function_changed) # Connect to update quantity range
-        data_type_h_layout.addWidget(self.data_type_cb)
-        data_type_h_layout.addStretch()
-        data_type_vbox.addLayout(data_type_h_layout)
-
-        swap_bytes_h_layout = QHBoxLayout()
-        swap_bytes_h_layout.addWidget(QLabel("Byte Order:"))
+        sl.addWidget(self.data_type_cb)
+        sl.addWidget(self._field("Byte order"))
         self.swap_bytes_cb = QComboBox()
-        self.swap_bytes_cb.addItems(["ABCD (No Swap)", "CDAB (Word Swap)", "BADC (Byte Swap within Words)", "DCBA (Full Byte Reverse)"]) # Added more swap options
-        self.swap_bytes_cb.setCurrentIndex(0)
-        swap_bytes_h_layout.addWidget(self.swap_bytes_cb)
-        swap_bytes_h_layout.addStretch()
-        data_type_vbox.addLayout(swap_bytes_h_layout)
-        
-        interpretation_and_polling_layout.addWidget(data_type_group)
+        self.swap_bytes_cb.addItems(self.BYTE_ORDERS)
+        sl.addWidget(self.swap_bytes_cb)
+        sl.addSpacing(14)
 
+        sl.addWidget(QLabel("STATISTICS", objectName="sectionTitle"))
+        grid = QGridLayout()
+        grid.setSpacing(6)
+        self.stat_cards = {}
+        for i, (key, label) in enumerate((("polls", "Polls"), ("failed", "Failed"), ("last", "Last [ms]"), ("avg", "Avg [ms]"))):
+            card = QFrame(objectName="card")
+            cv = QVBoxLayout(card)
+            cv.setContentsMargins(10, 6, 10, 6)
+            cv.setSpacing(0)
+            value = QLabel("0", objectName="cardValue")
+            cv.addWidget(value)
+            cv.addWidget(QLabel(label, objectName="cardLabel"))
+            grid.addWidget(card, i // 2, i % 2)
+            self.stat_cards[key] = value
+        sl.addLayout(grid)
+        sl.addStretch(1)
+        hint = QLabel("Double-click a value in the table to write it to the device.", objectName="hint")
+        hint.setWordWrap(True)
+        sl.addWidget(hint)
+        self.hsplit.addWidget(side)
 
-        # Cyclic Read Options (Right side of new layout)
-        cyclic_read_group = QGroupBox("Cyclic Read Options")
-        cyclic_read_vbox = QVBoxLayout()
-        cyclic_read_group.setLayout(cyclic_read_vbox)
-
-        polling_interval_layout = QHBoxLayout()
-        polling_interval_layout.addWidget(QLabel("Polling Interval (ms):"))
-        self.polling_interval_ms_sb = QSpinBox()
-        self.polling_interval_ms_sb.setRange(100, 60000) # 100ms to 60 seconds
-        self.polling_interval_ms_sb.setValue(1000) # Default 1 second
-        polling_interval_layout.addWidget(self.polling_interval_ms_sb)
-        polling_interval_layout.addStretch()
-        cyclic_read_vbox.addLayout(polling_interval_layout)
-
-        cyclic_buttons_layout = QHBoxLayout()
-        self.start_cyclic_read_btn = QPushButton("Start Cyclic Read")
-        self.start_cyclic_read_btn.clicked.connect(self.start_cyclic_read)
-        self.start_cyclic_read_btn.setEnabled(False)
-        cyclic_buttons_layout.addWidget(self.start_cyclic_read_btn)
-
-        self.stop_cyclic_read_btn = QPushButton("Stop Cyclic Read")
-        self.stop_cyclic_read_btn.clicked.connect(self.stop_cyclic_read)
-        self.stop_cyclic_read_btn.setEnabled(False)
-        cyclic_buttons_layout.addWidget(self.stop_cyclic_read_btn)
-        cyclic_buttons_layout.addStretch()
-        cyclic_read_vbox.addLayout(cyclic_buttons_layout)
-        
-        interpretation_and_polling_layout.addWidget(cyclic_read_group)
-        interpretation_and_polling_layout.addStretch() # Ensure groups don't expand too much
-
-        rw_layout.addLayout(interpretation_and_polling_layout) # Add combined layout to Modbus Operations group
-
-        main_layout.addWidget(read_write_group)
-
+        self.vsplit = QSplitter(Qt.Orientation.Vertical, childrenCollapsible=False)
         # --- Results Table ---
         self.registers_table = QTableWidget()
-        self.registers_table.setColumnCount(5) # Register, Raw Value, Interpreted Value, Type
-        self.registers_table.setHorizontalHeaderLabels([
-            "Register","Register (HEX)" ,"Raw Value (HEX/Bool)", "Value", "Type"
-        ])
+        self.registers_table.setColumnCount(5)
+        self.registers_table.setHorizontalHeaderLabels(["REGISTER", "REGISTER (HEX)", "RAW VALUE", "VALUE", "TYPE"])
         self.registers_table.cellDoubleClicked.connect(self.on_table_double_click)
-        self.registers_table.setColumnWidth(0, 100)
-        self.registers_table.setColumnWidth(1, 100)
-        self.registers_table.setColumnWidth(2, 130)
-        self.registers_table.setColumnWidth(3, 150)
-        self.registers_table.horizontalHeader().setStretchLastSection(True) # Last column stretches
-        main_layout.addWidget(self.registers_table)
+        self.registers_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.registers_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.registers_table.setAlternatingRowColors(True)
+        self.registers_table.setShowGrid(False)
+        self.registers_table.setFont(mono_font())
+        vh = self.registers_table.verticalHeader()
+        vh.setVisible(False)
+        vh.setDefaultSectionSize(24)
+        hh = self.registers_table.horizontalHeader()
+        hh.setHighlightSections(False)
+        hh.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        hh.setStretchLastSection(True)
+        for col, width in enumerate([100, 120, 220, 180]):
+            self.registers_table.setColumnWidth(col, width)
+        self.vsplit.addWidget(self.registers_table)
+
+        self.log_window = LogPanel(self) # Panel logu transmisji
+        self.vsplit.addWidget(self.log_window)
+        self.vsplit.setStretchFactor(0, 3)
+        self.vsplit.setStretchFactor(1, 2)
+        self.vsplit.setSizes([420, 260])
+        self.hsplit.addWidget(self.vsplit)
+        self.hsplit.setStretchFactor(1, 1)
+        self.hsplit.setSizes([240, 1000])
 
         # Status Bar
-        self.status_message_label = QLabel("Ready") # Persistent status message label
-        self.status_message_label.setStyleSheet("") # Default color
-        self.statusBar().addWidget(self.status_message_label, 1) # Add to status bar with stretch
+        sb = self.statusBar()
+        sb.setSizeGripEnabled(False)
+        self.status_message_label = QLabel("Ready")
+        sb.addWidget(self.status_message_label, 1)
+        self.channel_label = QLabel("")
+        sb.addPermanentWidget(self.channel_label)
+        sb.addPermanentWidget(QLabel(f"v{self.__version__}"))
 
-        self.stats_label = QLabel("") # Persistent stats label
-        self.statusBar().addPermanentWidget(self.stats_label) # Add to status bar, right-aligned
-        self.update_status_bar_stats() # Initial update
+    # --- Połączenie ---
 
     def populate_com_ports(self):
-        """Populates the QComboBox with available COM ports (keeps the current selection on refresh)."""
-        current = self.com_port_cb.currentText()
+        """Populates the port list (device name + description), keeping the current selection on refresh."""
+        current = self.com_port_cb.currentData() or self.settings.value("port", "")
         self.com_port_cb.clear()
-        ports = serial.tools.list_ports.comports()
+        ports = sorted(serial.tools.list_ports.comports(), key=lambda p: (len(p.device), p.device)) # COM3 przed COM12
+        for port in ports:
+            desc = port.description if port.description and port.description != "n/a" else ""
+            if desc.endswith(f"({port.device})"):
+                desc = desc[: -len(port.device) - 2].strip()
+            self.com_port_cb.addItem(f"{port.device}  ·  {desc}" if desc else port.device, port.device)
         if not ports:
-            self.com_port_cb.addItem("No COM Ports")
-            self.com_port_cb.setEnabled(False)
-            return
-
-        for port in sorted(ports, key=lambda p: (len(p.device), p.device)): # COM3 przed COM12
-            self.com_port_cb.addItem(port.device)
-            self.com_port_cb.setItemData(self.com_port_cb.count() - 1, port.description, Qt.ItemDataRole.ToolTipRole)
-        self.com_port_cb.setEnabled(True)
-        index = self.com_port_cb.findText(current)
+            self.com_port_cb.addItem("No COM ports", None)
+        index = self.com_port_cb.findData(current)
         if index >= 0:
             self.com_port_cb.setCurrentIndex(index)
 
     def on_connection_type_changed(self, index):
         """Toggles visibility of RTU/TCP parameters based on selected connection type."""
-        if index == 0: # RTU (Serial)
-            self.connection_type = "RTU"
-            self.rtu_params_widget.show() # Show widget with RTU parameters
-            self.tcp_params_widget.hide() # Hide widget with TCP parameters
-        else: # TCP/IP
-            self.connection_type = "TCP"
-            self.rtu_params_widget.hide() # Hide widget with RTU parameters
-            self.tcp_params_widget.show() # Show widget with TCP parameters
+        self.connection_type = "RTU" if index == 0 else "TCP"
+        self.rtu_btn.setChecked(index == 0)
+        self.tcp_btn.setChecked(index == 1)
+        self.rtu_params_widget.setVisible(index == 0)
+        self.tcp_params_widget.setVisible(index == 1)
 
-    def on_modbus_function_changed(self, index):
+    def set_connection_type(self, connection_type):
+        self.on_connection_type_changed(0 if connection_type == "RTU" else 1)
+
+    def on_modbus_function_changed(self, index=None):
         """Adjusts UI elements based on the selected Modbus function."""
         selected_function_text = self.modbus_function_cb.currentText()
         if "Coils" in selected_function_text or "Discrete Inputs" in selected_function_text:
-            # For coils/discrete inputs, data types are boolean, so hide interpretation options
-            self.data_type_cb.setCurrentText("UINT16 (16-bit Unsigned)") # Reset to default for consistency, though not used
+            # Bity - interpretacja typów nie ma zastosowania
             self.data_type_cb.setEnabled(False)
             self.swap_bytes_cb.setEnabled(False)
             self.num_registers_sb.setRange(1, 2000) # Max quantity for coils/discrete inputs
         else:
-            # For registers, enable interpretation options
             self.data_type_cb.setEnabled(True)
             self.swap_bytes_cb.setEnabled(True)
-            # Adjust max quantity based on selected data type for registers
             selected_data_type = self.data_type_cb.currentText()
             if "64-bit" in selected_data_type:
                 self.num_registers_sb.setRange(4, 125) # Min 4 registers for 64-bit
@@ -1567,39 +1793,57 @@ class ModbusClientApp(QMainWindow):
             else:
                 self.num_registers_sb.setRange(1, 125) # Min 1 register for 16-bit
 
+    def toggle_connection(self):
+        if self.modbus_client and self.modbus_client.connected:
+            self.disconnect_modbus()
+        else:
+            self.connect_modbus()
+
     def update_connection_buttons(self):
-        """Updates the state of Connect/Disconnect/Read/Cyclic Read buttons."""
+        """Updates the state of Connect/Disconnect, Read, Cyclic Read and the connection indicator."""
         is_connected = bool(self.modbus_client and self.modbus_client.connected)
         is_polling = self.polling_timer.isActive()
 
-        # Connect/Disconnect buttons
-        if self.connect_btn:
-            self.connect_btn.setEnabled(not is_connected and not is_polling) # Cannot connect if polling
-        if self.disconnect_btn:
-            self.disconnect_btn.setEnabled(is_connected and not is_polling) # Cannot disconnect if polling
+        if is_connected:
+            self.connect_btn.setText("Disconnect")
+            self.connect_btn.setObjectName("danger")
+            self.connect_btn.setIcon(icon(G_STOP, "#ffb3b3"))
+        else:
+            self.connect_btn.setText("Connect")
+            self.connect_btn.setObjectName("primary")
+            self.connect_btn.setIcon(icon(G_PLUG, ACCENT_INK))
+        repolish(self.connect_btn)
 
-        # Read Data button
-        if self.read_data_btn:
-            self.read_data_btn.setEnabled(is_connected and not is_polling) # Cannot read manually if polling
+        # parametry połączenia można zmieniać tylko bez połączenia
+        for w in (self.rtu_btn, self.tcp_btn, self.rtu_params_widget, self.tcp_params_widget, self.timeout_ms_sb):
+            w.setEnabled(not is_connected)
+        self.read_data_btn.setEnabled(is_connected and not is_polling)
+        self.cyclic_btn.setEnabled(is_connected)
+        self.cyclic_btn.blockSignals(True)
+        self.cyclic_btn.setChecked(is_polling)
+        self.cyclic_btn.setIcon(icon(G_STOP if is_polling else G_SYNC, "#dff5b0" if is_polling else C_TEXT))
+        self.cyclic_btn.blockSignals(False)
+        self.polling_interval_ms_sb.setEnabled(not is_polling)
 
-        # Cyclic Read buttons
-        if self.start_cyclic_read_btn:
-            self.start_cyclic_read_btn.setEnabled(is_connected and not is_polling)
-        if self.stop_cyclic_read_btn:
-            self.stop_cyclic_read_btn.setEnabled(is_connected and is_polling)
-        if self.polling_interval_ms_sb:
-            self.polling_interval_ms_sb.setEnabled(not is_polling) # Disable interval input when polling
+        if is_connected:
+            channel = self.modbus_client.channel
+            self.state_label.setText(f"Connected · {self.connection_type} {channel}")
+            self.state_dot.setStyleSheet(f"color: {C_GREEN};")
+            self.state_label.setStyleSheet(f"color: {C_TEXT};")
+            self.channel_label.setText(f"{self.connection_type} {channel}")
+        else:
+            self.state_label.setText("Disconnected")
+            self.state_dot.setStyleSheet(f"color: {C_DIM};")
+            self.state_label.setStyleSheet(f"color: {C_MUTED};")
+            self.channel_label.setText("")
 
     def update_status_bar_stats(self):
-        """Updates the status bar with polling statistics."""
-        stats_text = f"Polls: {self.total_polls}"
-        if self.failed_polls > 0:
-            stats_text += f" (Failed: {self.failed_polls})" # Add failed count
-        if self.total_polls > 0:
-            stats_text += f" | Last: {self.last_response_time:.1f}ms"
-            stats_text += f" | Avg: {self.average_response_time:.1f}ms"
-        self.stats_label.setText(stats_text) # Update dedicated stats label
-
+        """Updates the statistics cards in the sidebar."""
+        self.stat_cards["polls"].setText(str(self.total_polls))
+        self.stat_cards["failed"].setText(str(self.failed_polls))
+        self.stat_cards["failed"].setStyleSheet(f"color: {STATUS_RED};" if self.failed_polls else "")
+        self.stat_cards["last"].setText(f"{self.last_response_time:.1f}" if self.total_polls else "–")
+        self.stat_cards["avg"].setText(f"{self.average_response_time:.1f}" if self.total_polls else "–")
 
     def connect_modbus(self):
         """Establishes Modbus connection to the device."""
@@ -1610,44 +1854,39 @@ class ModbusClientApp(QMainWindow):
             timeout_seconds = self.timeout_ms_sb.value() / 1000.0 # Convert ms to seconds
 
             if self.connection_type == "RTU":
-                port = self.com_port_cb.currentText()
-                if port == "No COM Ports":
+                port = self.com_port_cb.currentData()
+                if not port:
                     QMessageBox.warning(self, "Port Error", "No COM port selected.")
                     return
-                baudrate = int(self.baud_rate_cb.currentText())
-                parity = self.parity_cb.currentText()
-                data_bits = int(self.data_bits_cb.currentText())
-                stop_bits = int(self.stop_bits_cb.currentText())
                 self.modbus_client = ModbusRtuMaster(
                     port=port,
-                    baudrate=baudrate,
-                    parity=parity,
-                    bytesize=data_bits,
-                    stopbits=stop_bits,
-                    timeout=timeout_seconds, # Use new timeout
+                    baudrate=int(self.baud_rate_cb.currentText()),
+                    parity=self.parity_cb.currentText(),
+                    bytesize=int(self.data_bits_cb.currentText()),
+                    stopbits=int(self.stop_bits_cb.currentText()),
+                    timeout=timeout_seconds,
                     log=self.log
                 )
             else: # TCP
-                host = self.ip_address_le.text()
-                port = int(self.port_le.text())
                 self.modbus_client = ModbusTcpMaster(
-                    host=host,
-                    port=port,
-                    timeout=timeout_seconds, # Use new timeout
+                    host=self.ip_address_le.text().strip(),
+                    port=int(self.port_le.text()),
+                    timeout=timeout_seconds,
                     log=self.log
                 )
 
             if self.modbus_client.connect():
                 self.status_message_label.setText(f"Connected to Modbus ({self.connection_type}).")
                 self.status_message_label.setStyleSheet("") # Reset color on success
+                self.save_settings()
             else:
                 self.status_message_label.setText(f"Connection error with Modbus ({self.connection_type}). "
                                                   "Check parameters (details in Transmission Log).")
-                self.status_message_label.setStyleSheet(f"color: {STATUS_RED};") # Set color to red on error
+                self.status_message_label.setStyleSheet(f"color: {STATUS_RED};")
                 self.modbus_client = None # Reset client on error
         except Exception as e:
             self.status_message_label.setText(f"Configuration or connection error: {e}")
-            self.status_message_label.setStyleSheet(f"color: {STATUS_RED};") # Set color to red on error
+            self.status_message_label.setStyleSheet(f"color: {STATUS_RED};")
             self.modbus_client = None # Reset client on error
         finally:
             self.update_connection_buttons()
@@ -1659,36 +1898,40 @@ class ModbusClientApp(QMainWindow):
         if self.modbus_client:
             self.modbus_client.close()
             self.modbus_client = None
-        
+
         # Reset statistics on disconnect
         self.total_polls = 0
-        self.failed_polls = 0 # Reset failed polls
+        self.failed_polls = 0
         self.last_response_time = 0.0
         self.sum_response_times = 0.0
         self.average_response_time = 0.0
 
         self.update_connection_buttons()
         self.registers_table.setRowCount(0) # Clear table on disconnect
-        self.status_message_label.setText("Ready") # Reset status message
-        self.status_message_label.setStyleSheet("") # Reset color
-        self.update_status_bar_stats() # Update stats after resetting
+        self.status_message_label.setText("Ready")
+        self.status_message_label.setStyleSheet("")
+        self.update_status_bar_stats()
 
+    # --- Odczyt cykliczny ---
+
+    def on_cyclic_toggled(self, checked):
+        if checked:
+            self.start_cyclic_read()
+        else:
+            self.stop_cyclic_read()
 
     def start_cyclic_read(self):
         """Starts cyclic Modbus data reading."""
         if not (self.modbus_client and self.modbus_client.connected):
             QMessageBox.warning(self, "Connection Error", "Not connected to Modbus device to start cyclic read.")
+            self.update_connection_buttons()
             return
 
         interval_ms = self.polling_interval_ms_sb.value()
-        if interval_ms <= 0:
-            QMessageBox.warning(self, "Invalid Interval", "Polling interval must be greater than 0 ms.")
-            return
-
         self.polling_timer.setInterval(interval_ms)
         self.polling_timer.start()
         self.status_message_label.setText(f"Cyclic read started with interval {interval_ms} ms.")
-        self.status_message_label.setStyleSheet("") # Reset color on start
+        self.status_message_label.setStyleSheet("")
         self.update_connection_buttons()
         self.update_status_bar_stats()
 
@@ -1696,17 +1939,19 @@ class ModbusClientApp(QMainWindow):
         """Stops cyclic Modbus data reading."""
         if self.polling_timer.isActive():
             self.polling_timer.stop()
-            # Disconnect the signal to prevent multiple connections if started again.
-            # This is safer than just stopping, as multiple connects could lead to issues.
-            try:
-                self.polling_timer.timeout.disconnect(self.read_modbus_data)
-            except TypeError: # If already disconnected, this will raise TypeError
-                pass
-            self.polling_timer.timeout.connect(self.read_modbus_data) # Reconnect for next start
             self.status_message_label.setText("Cyclic read stopped.")
-            self.status_message_label.setStyleSheet("") # Reset color on stop
+            self.status_message_label.setStyleSheet("")
         self.update_connection_buttons()
         self.update_status_bar_stats()
+
+    def style_result_rows(self):
+        """Kolory kolumn tabeli wyników: adresy przygaszone, wartość wyróżniona."""
+        dim, muted, accent = QColor(C_DIM), QColor(C_MUTED), QColor(ACCENT)
+        for row in range(self.registers_table.rowCount()):
+            for col, color in ((0, None), (1, dim), (2, muted), (3, accent), (4, muted)):
+                item = self.registers_table.item(row, col)
+                if item and color is not None:
+                    item.setForeground(color)
 
     def read_modbus_data(self):
         """Reads data from Modbus device based on selected function code."""
@@ -1779,6 +2024,7 @@ class ModbusClientApp(QMainWindow):
             self.average_response_time = self.sum_response_times / self.total_polls
 
             self.display_registers(start_address, data_to_display, selected_function_text)
+            self.style_result_rows()
             
             # Nowy, bardziej precyzyjny komunikat w zależności od ilości odebranych elementów
             if len(data_to_display) > 0:
@@ -2078,16 +2324,17 @@ class ModbusClientApp(QMainWindow):
             self.status_message_label.setText(f"Unexpected write error: {e}")
             self.status_message_label.setStyleSheet(f"color: {STATUS_RED};")
 
-    # --- Okno logów transmisji ---
+    # --- Log transmisji, skaner, ustawienia ---
 
     def log(self, kind, channel, data=b"", text=""):
-        """Wpis do okna logów (wywoływany przez klienta Modbus w wątku GUI)."""
+        """Wpis do panelu logów (wywoływany przez klienta Modbus w wątku GUI)."""
         self.log_window.add_entry((datetime.now(), kind, channel, bytes(data), text))
 
+    def on_log_toggled(self, visible):
+        self.log_window.setVisible(visible)
+
     def show_log_window(self):
-        self.log_window.show()
-        self.log_window.raise_()
-        self.log_window.activateWindow()
+        self.show_log_btn.setChecked(True)
 
     def show_scanner_window(self):
         if self.scanner_window is None:
@@ -2096,13 +2343,64 @@ class ModbusClientApp(QMainWindow):
         self.scanner_window.raise_()
         self.scanner_window.activateWindow()
 
+    SETTINGS_WIDGETS = { # klucz w pymms.ini -> nazwa widgetu
+        "baud": "baud_rate_cb", "parity": "parity_cb", "data_bits": "data_bits_cb", "stop_bits": "stop_bits_cb",
+        "function": "modbus_function_cb", "data_type": "data_type_cb", "byte_order": "swap_bytes_cb",
+    }
+    SETTINGS_SPINS = {
+        "timeout": "timeout_ms_sb", "slave_id": "slave_id_sb", "address": "start_address_sb",
+        "quantity": "num_registers_sb", "interval": "polling_interval_ms_sb",
+    }
+
+    def restore_settings(self):
+        s = self.settings
+        geometry = s.value("geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+        else:
+            self.resize(1280, 780)
+        for key, splitter in (("hsplit", self.hsplit), ("vsplit", self.vsplit)):
+            state = s.value(key)
+            if state is not None:
+                splitter.restoreState(state)
+        self.set_connection_type(s.value("connection_type", "RTU"))
+        for key, name in self.SETTINGS_WIDGETS.items():
+            value = s.value(key)
+            if value is not None:
+                getattr(self, name).setCurrentText(str(value))
+        self.on_modbus_function_changed()
+        for key, name in self.SETTINGS_SPINS.items():
+            value = s.value(key)
+            if value is not None:
+                getattr(self, name).setValue(int(value))
+        self.ip_address_le.setText(str(s.value("ip", self.ip_address_le.text())))
+        self.port_le.setText(str(s.value("tcp_port", self.port_le.text())))
+        self.show_log_btn.setChecked(s.value("log_visible", True, type=bool))
+
+    def save_settings(self):
+        s = self.settings
+        s.setValue("geometry", self.saveGeometry())
+        s.setValue("hsplit", self.hsplit.saveState())
+        s.setValue("vsplit", self.vsplit.saveState())
+        s.setValue("connection_type", self.connection_type)
+        if self.com_port_cb.currentData():
+            s.setValue("port", self.com_port_cb.currentData())
+        for key, name in self.SETTINGS_WIDGETS.items():
+            s.setValue(key, getattr(self, name).currentText())
+        for key, name in self.SETTINGS_SPINS.items():
+            s.setValue(key, getattr(self, name).value())
+        s.setValue("ip", self.ip_address_le.text())
+        s.setValue("tcp_port", self.port_le.text())
+        s.setValue("log_visible", self.show_log_btn.isChecked())
+        s.sync()
+
     def closeEvent(self, event):
         self.polling_timer.stop()
+        self.save_settings()
         if self.scanner_window:
             self.scanner_window.close()
         if self.modbus_client:
             self.modbus_client.close()
-        self.log_window.close()
         super().closeEvent(event)
 
 
@@ -2113,7 +2411,7 @@ if __name__ == "__main__":
     except Exception:
         pass
     app = QApplication(sys.argv)
-    app.setStyleSheet(ACCENT_STYLESHEET)
+    apply_theme(app)
     window = ModbusClientApp()
     window.show()
     sys.exit(app.exec())

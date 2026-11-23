@@ -23,7 +23,8 @@ pymms bez fizycznego urządzenia.
   niepełne i spóźnione odpowiedzi.
 - **Skaner** – wyszukiwanie urządzeń w zakresie Slave ID albo rejestrów w zakresie adresów, z eksportem wyników
   do pliku CSV gotowego do wczytania w pymss.
-- Statystyki na pasku statusu: liczba odpytań, liczba błędów, czas ostatniej odpowiedzi i średni czas odpowiedzi.
+- Statystyki: liczba odpytań, liczba błędów, czas ostatniej odpowiedzi i średni czas odpowiedzi.
+- Ciemny interfejs z zielonym kolorem wiodącym. Program zapamiętuje ustawienia połączenia i zapytania oraz układ okna.
 - Własna implementacja Modbus master (TCP i RTU) – nie wymaga biblioteki pymodbus.
 
 ## Wymagania i uruchomienie
@@ -47,40 +48,56 @@ pyinstaller pymms.spec
 
 ## Instrukcja obsługi
 
-### 1. Połączenie (Connection Configuration)
+Okno składa się z czterech części:
+- **górny pasek** – połączenie,
+- **drugi pasek** – parametry zapytania,
+- **panel boczny** – interpretacja danych i statystyki,
+- **obszar główny** – tabela wyników, a pod nią log transmisji.
 
-| Pole | Opis |
+Ustawienia i układ okna są zapamiętywane między uruchomieniami w pliku **`pymms.ini` obok programu**
+(obok `pymms.pyw` albo `pymms.exe`). Plik jest tekstowy i można go skopiować razem z programem albo usunąć,
+żeby wrócić do ustawień domyślnych. Jeśli katalog programu jest tylko do odczytu (np. `Program Files`),
+plik trafia do katalogu konfiguracji użytkownika: `%LOCALAPPDATA%\pymms` w Windows albo `~/.config/pymms`
+w Linuksie.
+
+### 1. Połączenie (górny pasek)
+
+| Element | Opis |
 |---|---|
-| **Type** | `RTU (Serial)` lub `TCP/IP` |
-| **COM Port, Baud Rate, Parity, Data Bits, Stop Bits** | Parametry portu szeregowego (RTU) |
-| **IP Address, Port** | Adres i port urządzenia (TCP), domyślnie `127.0.0.1:502` |
-| **Timeout (ms)** | Czas oczekiwania na odpowiedź (100–30000 ms) |
+| **RTU / TCP** | Rodzaj połączenia: Modbus RTU przez port szeregowy albo Modbus TCP/IP |
+| Lista portów, **↻** | Port COM z opisem urządzenia (np. `COM3 · USB-SERIAL CH340`); przycisk odświeża listę |
+| Prędkość, bity danych, parzystość, bity stopu | Parametry portu szeregowego (RTU), np. `9600`, `8`, `N`, `1` |
+| Adres `:` port | Adres IP lub nazwa hosta i port urządzenia (TCP), domyślnie port 502 |
+| **Timeout** | Czas oczekiwania na odpowiedź (100–30000 ms) |
 
-Przycisk **Connect** nawiązuje połączenie, a **Disconnect** je zamyka i zeruje statystyki.
+Przycisk **Connect** nawiązuje połączenie i zmienia się w czerwony przycisk **Disconnect**. Ten zamyka połączenie
+i zeruje statystyki. W trakcie połączenia parametrów połączenia nie można zmieniać. Stan połączenia widać po
+prawej stronie paska: zielona kropka i adres urządzenia.
 
-### 2. Odczyt danych (Modbus Operations)
+### 2. Odczyt danych (drugi pasek)
 
-1. Ustaw **Slave ID**, **Start Address** i **Quantity**.
-2. Wybierz funkcję: `0x03 (Holding Registers)`, `0x04 (Input Registers)`, `0x01 (Coils)` lub
+1. Ustaw **Slave ID**, **Address** i **Quantity**.
+2. Wybierz funkcję (**Function**): `0x03 (Holding Registers)`, `0x04 (Input Registers)`, `0x01 (Coils)` lub
    `0x02 (Discrete Inputs)`.
-3. Kliknij **Read Data**.
+3. Kliknij **Read**.
 
 Maksymalna ilość to 125 rejestrów albo 2000 bitów. Dla typów 32-bitowych minimum to 2 rejestry, a dla
 64-bitowych 4 rejestry.
 
-### 3. Interpretacja danych (Data Interpretation)
+### 3. Interpretacja danych (panel boczny)
 
 - **Interpret as** – typ danych, na który składane są kolejne rejestry. Typy 32-bitowe zajmują 2 rejestry,
   64-bitowe 4 rejestry, a każdy wiersz tabeli pokazuje jedną wartość.
-- **Byte Order** – kolejność bajtów dla typów wielorejestrowych (patrz tabela niżej).
+- **Byte order** – kolejność bajtów dla typów wielorejestrowych (patrz tabela niżej).
 
-Kolumna **Raw Value** pokazuje surowe rejestry w HEX, a kolumna **Value** wartość po interpretacji.
+Kolumna **RAW VALUE** pokazuje surowe rejestry w HEX, a kolumna **VALUE** (wyróżniona na zielono) wartość
+po interpretacji.
 
 ![Odczyt FLOAT32 z zamianą słów](docs/pymms_float.png)
 
 ### 4. Zapis wartości
 
-Kliknij dwukrotnie komórkę w kolumnie **Value**, wpisz nową wartość i zatwierdź **OK**. Zakres jest sprawdzany
+Kliknij dwukrotnie komórkę w kolumnie **VALUE**, wpisz nową wartość i zatwierdź **OK**. Zakres jest sprawdzany
 dla wybranego typu. Po udanym zapisie pymms automatycznie odczytuje dane ponownie. Cykliczny odczyt jest
 zatrzymywany przed zapisem.
 
@@ -94,20 +111,21 @@ zatrzymywany przed zapisem.
 
 Discrete Inputs i Input Registers są w Modbus tylko do odczytu, więc urządzenie odrzuci zapis do nich.
 
-### 5. Cykliczny odczyt (Cyclic Read Options)
+### 5. Cykliczny odczyt
 
-Ustaw **Polling Interval (ms)** i kliknij **Start Cyclic Read**. Odczyt powtarza się z bieżącymi parametrami, aż
-klikniesz **Stop Cyclic Read**. Odczyt zatrzymuje się też sam po utracie połączenia lub przekroczeniu czasu
+Ustaw interwał w polu **every** i włącz przełącznik **Cyclic read**. Odczyt powtarza się z bieżącymi parametrami,
+aż ponownie klikniesz przełącznik. Odczyt zatrzymuje się też sam po utracie połączenia lub przekroczeniu czasu
 odpowiedzi.
 
-Pasek statusu pokazuje liczbę odpytań (**Polls**), liczbę nieudanych odpytań (**Failed**) oraz czas ostatniej
-(**Last**) i średni czas odpowiedzi (**Avg**) w milisekundach.
+Kafelki **STATISTICS** w panelu bocznym pokazują liczbę odpytań (**Polls**), liczbę nieudanych odpytań (**Failed**,
+na czerwono, gdy są błędy) oraz czas ostatniej (**Last**) i średni czas odpowiedzi (**Avg**) w milisekundach.
 
-### 6. Okno logów transmisji
+### 6. Log transmisji
 
-Przycisk **Transmission Log** otwiera okno z pełnym zapisem komunikacji, takie samo jak w pymss.
+Panel **TRANSMISSION LOG** pod tabelą wyników pokazuje pełny zapis komunikacji. Przycisk **Log** na drugim
+pasku chowa i pokazuje panel, a granicę między tabelą a logiem można przesuwać.
 
-![Okno logów transmisji](docs/pymms_log.png)
+![Log transmisji](docs/pymms_log.png)
 
 Każda linia zawiera czas z dokładnością do milisekundy, kierunek (**TX** – zapytanie wysłane przez pymms,
 **RX** – odpowiedź urządzenia), kanał (adres IP:port albo port COM), długość i pełną ramkę w HEX. Pod ramką jest
@@ -119,8 +137,13 @@ Na czerwono (**ERROR**) zapisywane są problemy z komunikacją:
 - spóźniona odpowiedź na poprzednie zapytanie, odrzucona przed wysłaniem kolejnego,
 - odpowiedź od innego Slave ID niż odpytywany, zerwane połączenie, błąd portu szeregowego.
 
-Opcje okna: filtry **RX / TX / Info / Errors**, **Decode frames**, **Pause**, **Auto-scroll**, limit linii
-(**Max lines**), **Clear** i zapis do pliku (**Save...**).
+Opcje panelu:
+- kolorowe filtry **TX / RX / Info / Errors**,
+- **Decode** – dekodowanie ramek,
+- **Follow** – przewijanie do najnowszych wpisów,
+- **Pause** – wstrzymanie dopisywania,
+- **Max lines** – limit linii,
+- **Clear** i **Save** – czyszczenie i zapis do pliku tekstowego.
 
 ### 7. Skaner
 
@@ -144,7 +167,7 @@ Większa wartość przyspiesza skanowanie, ale jeden niezdefiniowany adres w blo
 | **Timeout (ms)** | Czas oczekiwania na odpowiedź używany tylko przez skaner. Krótszy timeout przyspiesza skanowanie zakresu, w którym większość ID nie odpowiada. |
 | **Delay between requests (ms)** | Przerwa między zapytaniami. Przydatna przy wolnych urządzeniach RTU. |
 | **Show only responding** | Pokazuje tylko znalezione urządzenia lub rejestry. Po odznaczeniu widać także timeouty i wyjątki. |
-| **Log frames in Transmission Log** | Zapisuje ramki skanera w oknie logów. Wyłącz przy dużych zakresach, żeby nie zalać logu. |
+| **Log frames in Transmission Log** | Zapisuje ramki skanera w logu transmisji. Wyłącz przy dużych zakresach, żeby nie zalać logu. |
 
 Wiersze są kolorowane według wyniku: zielony – odpowiedź z danymi, pomarańczowy – wyjątek, czerwony – błąd.
 **Stop** przerywa skanowanie od razu. Przy utracie połączenia skaner zatrzymuje się sam.
@@ -169,5 +192,5 @@ Dla typów 64-bitowych `CDAB` zamienia połówki 32-bitowe (`W2 W3 W0 W1`).
 
 1. Uruchom [pymss](https://github.com/exoper7/pymss), wybierz `TCP/IP` z portem np. `1502`, zaimportuj
    `example_registers.csv` i kliknij **Start Server**.
-2. W pymms wybierz `TCP/IP`, adres `127.0.0.1` i port `1502`, a następnie kliknij **Connect**.
-3. Odczytaj `0x03 (Holding Registers)` od adresu 0. W oknie logów pymss zobaczysz każdą ramkę zapytania i odpowiedzi.
+2. W pymms wybierz **TCP**, wpisz adres `127.0.0.1` i port `1502`, a następnie kliknij **Connect**.
+3. Odczytaj `0x03 (Holding Registers)` od adresu 0. Te same ramki zobaczysz w logu pymms i w oknie logów pymss.
